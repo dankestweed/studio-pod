@@ -4,7 +4,7 @@ FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl ca-certificates python3 python3-venv python3-pip \
+      git curl wget ca-certificates python3 python3-venv python3-pip \
       openssh-server unzip && \
     rm -rf /var/lib/apt/lists/*
 
