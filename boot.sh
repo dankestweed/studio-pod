@@ -93,7 +93,6 @@ done
 case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/swarmui.log)";; esac
 
 sleep 8
-
 # reference images: library inputs/ <-> ComfyUI input/ (copy both ways, never delete)
 COMFY_INPUT="$(dirname "$COMFY_MAIN")/input"
 mkdir -p "$COMFY_INPUT"
@@ -114,7 +113,7 @@ rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
       --data-urlencode "gpu=${GU}" --data-urlencode "vram_used=${VU}" --data-urlencode "vram_total=${VT}" \
       --data-urlencode "temp=${GT}" --data-urlencode "ram_used=${RU}" --data-urlencode "ram_total=${RT}" \
       --data-urlencode "disk_used=${DU}" --data-urlencode "disk_total=${DT}" >/dev/null 2>&1 || true
-    sleep 10
+    sleep 4
   done ) &
 
 report ready "engine online at ${TSIP} with ${N} worker(s)"
