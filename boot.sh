@@ -93,6 +93,17 @@ done
 case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/swarmui.log)";; esac
 
 sleep 8
+
+# reference images: library inputs/ <-> ComfyUI input/ (copy both ways, never delete)
+COMFY_INPUT="$(dirname "$COMFY_MAIN")/input"
+mkdir -p "$COMFY_INPUT"
+rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
+( while true; do
+    sleep 60
+    rclone copy "$COMFY_INPUT" storagebox:inputs --exclude "*.tmp" --exclude "clipspace/**" 2>/dev/null || true
+    rclone copy storagebox:inputs "$COMFY_INPUT" 2>/dev/null || true
+  done ) &
+
 report ready "engine online at ${TSIP} with ${N} worker(s)"
 echo "READY at ${TSIP}"
 sleep infinity
