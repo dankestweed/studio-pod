@@ -104,6 +104,19 @@ rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
     rclone copy storagebox:inputs "$COMFY_INPUT" 2>/dev/null || true
   done ) &
 
+# live metrics for the dashboard dials, every 10s
+( while true; do
+    G=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    IFS=, read -r GU VU VT GT <<< "${G:-,,,}"
+    read -r RU RT <<< "$(free -m | awk '/Mem:/ {print $3, $2}')"
+    read -r DU DT <<< "$(df -m / | awk 'NR==2 {print $3, $2}')"
+    curl -m 5 -s -X POST "${PORTAL_URL:-}/api/pod/metrics" -H "X-Pod-Secret: ${POD_SECRET:-}" \
+      --data-urlencode "gpu=${GU}" --data-urlencode "vram_used=${VU}" --data-urlencode "vram_total=${VT}" \
+      --data-urlencode "temp=${GT}" --data-urlencode "ram_used=${RU}" --data-urlencode "ram_total=${RT}" \
+      --data-urlencode "disk_used=${DU}" --data-urlencode "disk_total=${DT}" >/dev/null 2>&1 || true
+    sleep 10
+  done ) &
+
 report ready "engine online at ${TSIP} with ${N} worker(s)"
 echo "READY at ${TSIP}"
 sleep infinity
