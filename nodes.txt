@@ -1,0 +1,5 @@
+# Custom ComfyUI nodes baked into the image. One per line:
+#   <git-url>@<commit-sha>     (pinned - always do this)
+#   <git-url>                  (tracks default branch - avoid; rebuilds become non-reproducible)
+# After editing: commit -> Actions rebuilds :latest -> next Start has the nodes.
+https://github.com/lbouaraba/ComfyUI-Krea2Edit@86f886dac23013d88996e3a2e99093ba44d322fb
