@@ -43,13 +43,24 @@ port = 23
 key_file = /root/.ssh/storagebox
 shell_type = none
 CONF
+# a dead sftp stream must error out, never hang the boot or the sync loops
+export RCLONE_TIMEOUT=60s RCLONE_CONTIMEOUT=30s RCLONE_LOW_LEVEL_RETRIES=5
 rclone lsd storagebox: >/dev/null 2>&1 || fail "storage unreachable"
 
 report models "syncing models"
-# models live on the 60GB volume (/workspace): fits the growing library and survives Stop->Resume
+# models live on the volume (/workspace): fits the growing library and survives Stop->Resume
 mkdir -p /workspace/Models
 rclone sync storagebox:models /workspace/Models --transfers 8 --checkers 16 --fast-list \
-  2>/tmp/rclone-sync.log || report models "sync warnings (continuing)"
+  --stats 10s --stats-one-line --log-level NOTICE --log-file /tmp/rclone-sync.log &
+SYNC_PID=$!
+( while kill -0 "$SYNC_PID" 2>/dev/null; do
+    sleep 10
+    L=$(grep -E '%,.*ETA' /tmp/rclone-sync.log 2>/dev/null | tail -1 | sed 's/^.*NOTICE:[[:space:]]*//' | tr -s ' ')
+    [ -n "$L" ] && report models "${L}"
+  done ) &
+PROG_PID=$!
+wait "$SYNC_PID" || report models "sync warnings (continuing)"
+kill "$PROG_PID" 2>/dev/null || true
 
 report engine "configuring ${WORKERS:-1} worker(s)"
 COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*' | head -1)
@@ -90,6 +101,7 @@ code=""
 for i in $(seq 1 120); do
   code=$(curl -m 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7801/" || true)
   case "$code" in 200|302) break;; esac
+  [ $((i % 6)) -eq 0 ] && report engine "waited $((i * 5))s for first response"
   sleep 5
 done
 case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/swarmui.log)";; esac
@@ -99,10 +111,25 @@ sleep 8
 COMFY_INPUT="$(dirname "$COMFY_MAIN")/input"
 mkdir -p "$COMFY_INPUT"
 rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
+# rescue generated outputs: raw comfy-tab saves land on the pod, not the VPS -> push
+# them home every minute into a per-session folder (comfy renumbers from 00001 each
+# session, so a shared folder would overwrite across sessions)
+SESSION_TAG=$(date +%Y%m%d-%H%M%S)
+COMFY_OUT="$(dirname "$COMFY_MAIN")/output"
+mkdir -p "$COMFY_OUT" /SwarmUI/Output
+
+# workflows: library workflows/ <-> ComfyUI's native workflow browser (two-way, never delete)
+COMFY_WF="$(dirname "$COMFY_MAIN")/user/default/workflows"
+mkdir -p "$COMFY_WF"
+rclone copy storagebox:workflows "$COMFY_WF" 2>/dev/null || true
 ( while true; do
     sleep 60
     rclone copy "$COMFY_INPUT" storagebox:inputs --exclude "*.tmp" --exclude "clipspace/**" 2>/dev/null || true
     rclone copy storagebox:inputs "$COMFY_INPUT" 2>/dev/null || true
+    rclone copy "$COMFY_WF" storagebox:workflows --exclude "*.tmp" 2>/dev/null || true
+    rclone copy storagebox:workflows "$COMFY_WF" 2>/dev/null || true
+    rclone copy "$COMFY_OUT" "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
+    rclone copy /SwarmUI/Output "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
   done ) &
 
 # live metrics for the dashboard dials, every 4s
@@ -110,7 +137,8 @@ rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
     G=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     IFS=, read -r GU VU VT GT <<< "${G:-,,,}"
     read -r RU RT <<< "$(free -m | awk '/Mem:/ {print $3, $2}')"
-    read -r DU DT <<< "$(df -m /workspace / 2>/dev/null | awk 'NR==2 {print $3, $2}')"
+    read -r DU DT <<< "$(df -m /workspace 2>/dev/null | awk 'NR==2 {print $3, $2}')"
+    [ -z "$DT" ] && read -r DU DT <<< "$(df -m / | awk 'NR==2 {print $3, $2}')"
     curl -m 5 -s -X POST "${PORTAL_URL:-}/api/pod/metrics" -H "X-Pod-Secret: ${POD_SECRET:-}" \
       --data-urlencode "gpu=${GU}" --data-urlencode "vram_used=${VU}" --data-urlencode "vram_total=${VT}" \
       --data-urlencode "temp=${GT}" --data-urlencode "ram_used=${RU}" --data-urlencode "ram_total=${RT}" \
