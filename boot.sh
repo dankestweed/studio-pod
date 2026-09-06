@@ -89,6 +89,7 @@ ${T}enabled: true
 ${T}settings:
 ${T}${T}StartScript: ${COMFY_REL}
 ${T}${T}GPU_ID: 0
+${T}${T}ExtraArgs: --enable-cors-header
 BEND
 done
 
