@@ -3,7 +3,7 @@
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git curl wget ca-certificates python3 python3-venv python3-pip \
+      git curl wget ca-certificates python3 python3-venv python3-pip gcc python3-dev \
       openssh-server unzip ffmpeg libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 && \
     rm -rf /var/lib/apt/lists/*
 # rclone + tailscale baked in (no boot-time installs)

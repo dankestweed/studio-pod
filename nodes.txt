@@ -2,4 +2,5 @@
 #   <git-url>@<commit-sha>     (pinned - always do this)
 #   <git-url>                  (tracks default branch - avoid; rebuilds become non-reproducible)
 # After editing: commit -> Actions rebuilds :latest -> next Start has the nodes.
+# rebuild 2026-09-06: bust node-layer cache to confirm the pack bakes in
 https://github.com/lbouaraba/ComfyUI-Krea2Edit@86f886dac23013d88996e3a2e99093ba44d322fb

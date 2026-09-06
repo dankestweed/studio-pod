@@ -56,6 +56,7 @@ SYNC_PID=$!
 ( while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 10
     L=$(grep -E '%,.*ETA' /tmp/rclone-sync.log 2>/dev/null | tail -1 | sed 's/^.*NOTICE:[[:space:]]*//' | tr -s ' ')
+    [ -z "$L" ] && L=$(grep 'NOTICE:' /tmp/rclone-sync.log 2>/dev/null | tail -1 | sed 's/^.*NOTICE:[[:space:]]*//' | tr -s ' ')
     [ -n "$L" ] && report models "${L}"
   done ) &
 PROG_PID=$!
@@ -65,6 +66,17 @@ kill "$PROG_PID" 2>/dev/null || true
 report engine "configuring ${WORKERS:-1} worker(s)"
 COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*' | head -1)
 COMFY_REL=${COMFY_MAIN#/SwarmUI/}
+# custom nodes: library custom_nodes/ -> ComfyUI (add-only) + their pip requirements, before the engine loads
+if rclone lsd storagebox:custom_nodes >/dev/null 2>&1; then
+  report engine "installing custom nodes"
+  CN_DIR="$(dirname "$COMFY_MAIN")/custom_nodes"
+  rclone copy storagebox:custom_nodes "$CN_DIR" 2>/dev/null || true
+  PIPBIN="$(dirname "$COMFY_MAIN")/venv/bin/pip"
+  [ -x "$PIPBIN" ] || PIPBIN=pip
+  for RQ in "$CN_DIR"/*/requirements.txt; do
+    [ -f "$RQ" ] && "$PIPBIN" install -q -r "$RQ" 2>/dev/null || true
+  done
+fi
 mkdir -p /SwarmUI/Data
 T=$(printf '\t')
 cat > /SwarmUI/Data/Settings.fds <<SET
@@ -146,6 +158,41 @@ rclone copy storagebox:workflows "$COMFY_WF" 2>/dev/null || true
       --data-urlencode "disk_used=${DU}" --data-urlencode "disk_total=${DT}" >/dev/null 2>&1 || true
     sleep 4
   done ) &
+
+# generation timings for the dashboard strip: poll each worker's queue/history, post every 10s
+cat > /tmp/genpoll.py <<'PY'
+import json, os, time, urllib.request, urllib.parse
+PORTAL = os.environ.get("PORTAL_URL", ""); SECRET = os.environ.get("POD_SECRET", "")
+def get(u):
+    try:
+        with urllib.request.urlopen(u, timeout=4) as r: return json.load(r)
+    except Exception: return None
+while True:
+    runs, running, pending = [], 0, 0
+    for p in range(7821, 7829):
+        q = get(f"http://127.0.0.1:{p}/queue")
+        if q is None: continue
+        running += len(q.get("queue_running") or []); pending += len(q.get("queue_pending") or [])
+        h = get(f"http://127.0.0.1:{p}/history?max_items=8") or {}
+        for rec in h.values():
+            st = rec.get("status") or {}
+            ts = {}
+            for m in st.get("messages") or []:
+                if isinstance(m, list) and len(m) > 1 and isinstance(m[1], dict) and m[1].get("timestamp"):
+                    ts[m[0]] = m[1]["timestamp"]
+            a, b = ts.get("execution_start"), ts.get("execution_success") or ts.get("execution_error")
+            if a and b:
+                runs.append({"t": b/1000.0, "seconds": round((b-a)/1000.0, 1),
+                             "worker": p-7821, "ok": st.get("status_str") == "success"})
+    runs.sort(key=lambda r: -r["t"])
+    data = urllib.parse.urlencode({"payload": json.dumps({"runs": runs[:6], "running": running, "pending": pending})}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(PORTAL + "/api/pod/gens", data=data,
+                                                      headers={"X-Pod-Secret": SECRET}), timeout=5)
+    except Exception: pass
+    time.sleep(10)
+PY
+nohup python3 /tmp/genpoll.py >/dev/null 2>&1 &
 
 report ready "engine online at ${TSIP} with ${N} worker(s)"
 echo "READY at ${TSIP}"
