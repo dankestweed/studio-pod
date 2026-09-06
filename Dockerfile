@@ -20,18 +20,18 @@ RUN git clone --depth 1 https://github.com/mcmonkeyprojects/SwarmUI.git . && \
 # and pre-install the packages Swarm would otherwise fetch on first launch
 RUN export PATH="/SwarmUI/.dotnet:$PATH" && \
     bash launchtools/comfy-install-linux.sh nv && \
-    COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*' | head -1)) && \
+    COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
     "$COMFY_DIR/venv/bin/pip" install --no-cache-dir --force-reinstall \
         torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     "$COMFY_DIR/venv/bin/pip" install --no-cache-dir \
         rembg onnxruntime matplotlib opencv-python-headless imageio-ffmpeg dill omegaconf diffusers ultralytics && \
-    "$COMFY_DIR/venv/bin/pip" cache purge || true && \
+    { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
     rm -rf "$COMFY_DIR/.git" /root/.cache/pip
 # Custom ComfyUI nodes from nodes.txt, cloned at pinned commits and their pip
 # requirements installed at build time (zero boot-time cost; build fails loudly
 # if a node or its deps are broken)
 COPY nodes.txt /studio/nodes.txt
-RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*' | head -1)) && \
+RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
     cd "$COMFY_DIR/custom_nodes" && \
     while IFS= read -r spec || [ -n "$spec" ]; do \
       case "$spec" in ""|"#"*) continue;; esac; \
@@ -42,7 +42,8 @@ RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*
       if [ -f "$name/requirements.txt" ]; then "$COMFY_DIR/venv/bin/pip" install --no-cache-dir -r "$name/requirements.txt" || exit 1; fi; \
       rm -rf "$name/.git"; \
     done < /studio/nodes.txt && \
-    "$COMFY_DIR/venv/bin/pip" cache purge || true && \
+    echo "== custom_nodes now: $(ls "$COMFY_DIR/custom_nodes")" && \
+    { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
     rm -rf /root/.cache/pip
 COPY boot.sh /studio/boot.sh
 RUN chmod +x /studio/boot.sh

@@ -64,7 +64,7 @@ wait "$SYNC_PID" || report models "sync warnings (continuing)"
 kill "$PROG_PID" 2>/dev/null || true
 
 report engine "configuring ${WORKERS:-1} worker(s)"
-COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*ComfyUI*' | head -1)
+COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)
 COMFY_REL=${COMFY_MAIN#/SwarmUI/}
 # custom nodes: library custom_nodes/ -> ComfyUI (add-only) + their pip requirements, before the engine loads
 if rclone lsd storagebox:custom_nodes >/dev/null 2>&1; then
