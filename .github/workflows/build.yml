@@ -2,7 +2,7 @@ name: Build studio pod image
 on:
   workflow_dispatch: {}
   push:
-    paths: ["Dockerfile", "boot.sh", ".github/workflows/build.yml"]
+    paths: ["Dockerfile", "boot.sh", "nodes.txt", ".github/workflows/build.yml"]
 permissions:
   contents: read
   packages: write
@@ -32,3 +32,5 @@ jobs:
           tags: |
             ${{ steps.img.outputs.name }}:latest
             ${{ steps.img.outputs.name }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ steps.img.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ steps.img.outputs.name }}:buildcache,mode=max
