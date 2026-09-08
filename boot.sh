@@ -24,7 +24,7 @@ mkdir -p /var/lib/tailscale
 pgrep tailscaled >/dev/null || nohup tailscaled --tun=userspace-networking \
   --statedir=/var/lib/tailscale > /var/log/tailscaled.log 2>&1 &
 sleep 2
-tailscale up --authkey "${TS_AUTHKEY:?TS_AUTHKEY missing}" --hostname gpu-pod --timeout 60s \
+tailscale up --authkey "${TS_AUTHKEY:?TS_AUTHKEY missing}" --hostname "gpu-pod${TENANT_SLUG:+-$TENANT_SLUG}" --timeout 60s \
   || fail "tailscale join failed"
 TSIP=$(tailscale ip -4 2>/dev/null | head -1)
 [ -n "$TSIP" ] || fail "no tailscale ip"
@@ -47,11 +47,31 @@ CONF
 export RCLONE_TIMEOUT=60s RCLONE_CONTIMEOUT=30s RCLONE_LOW_LEVEL_RETRIES=5
 rclone lsd storagebox: >/dev/null 2>&1 || fail "storage unreachable"
 
-report models "syncing models"
+# session manifest: the portal says whether this Start is a selected-workflows session
+# (sync only whats needed) or a full-library one. Any failure -> full (old behavior).
+MODE=full
+curl -m 10 -s "${PORTAL_URL:-}/api/pod/manifest" -H "X-Pod-Secret: ${POD_SECRET:-}" -o /tmp/manifest.json || true
+if python3 - <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open("/tmp/manifest.json"))
+ok = d.get("mode") == "selected" and d.get("models")
+open("/tmp/models.list", "w").write("".join(m + "\n" for m in d.get("models") or []))
+open("/tmp/wf.list", "w").write("".join(w + "\n" for w in d.get("workflows") or []))
+sys.exit(0 if ok else 1)
+PY
+then MODE=selected; fi
+
 # models live on the volume (/workspace): fits the growing library and survives Stop->Resume
 mkdir -p /workspace/Models
-rclone sync storagebox:models /workspace/Models --transfers 8 --checkers 16 --fast-list \
-  --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
+if [ "$MODE" = selected ]; then
+  report models "syncing $(wc -l < /tmp/models.list | tr -d ' ') selected model(s)"
+  rclone copy storagebox:models /workspace/Models --files-from /tmp/models.list --transfers 8 --checkers 16 \
+    --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
+else
+  report models "syncing models"
+  rclone sync storagebox:models /workspace/Models --transfers 8 --checkers 16 --fast-list \
+    --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
+fi
 SYNC_PID=$!
 ( while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 10
@@ -134,13 +154,15 @@ mkdir -p "$COMFY_OUT" /SwarmUI/Output
 # workflows: library workflows/ <-> ComfyUI's native workflow browser (two-way, never delete)
 COMFY_WF="$(dirname "$COMFY_MAIN")/user/default/workflows"
 mkdir -p "$COMFY_WF"
-rclone copy storagebox:workflows "$COMFY_WF" 2>/dev/null || true
+WF_SEL=""; [ "$MODE" = selected ] && [ -s /tmp/wf.list ] && WF_SEL="--files-from /tmp/wf.list"
+# selected sessions get ONLY their chosen workflows (unvalidated ones must not open on the pod)
+rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
 ( while true; do
     sleep 60
     rclone copy "$COMFY_INPUT" storagebox:inputs --exclude "*.tmp" --exclude "clipspace/**" 2>/dev/null || true
     rclone copy storagebox:inputs "$COMFY_INPUT" 2>/dev/null || true
     rclone copy "$COMFY_WF" storagebox:workflows --exclude "*.tmp" 2>/dev/null || true
-    rclone copy storagebox:workflows "$COMFY_WF" 2>/dev/null || true
+    rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
     rclone copy "$COMFY_OUT" "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
     rclone copy /SwarmUI/Output "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
   done ) &
@@ -193,6 +215,23 @@ while True:
     time.sleep(10)
 PY
 nohup python3 /tmp/genpoll.py >/dev/null 2>&1 &
+
+# node registry: once a worker answers, push the full class list home (arms pre-flight node checks)
+cat > /tmp/nodespush.py <<'PY'
+import json, os, time, urllib.request, urllib.parse
+for _ in range(60):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:7821/object_info", timeout=8) as r:
+            classes = sorted(json.load(r).keys())
+        data = urllib.parse.urlencode({"payload": json.dumps(classes)}).encode()
+        req = urllib.request.Request(os.environ.get("PORTAL_URL", "") + "/api/pod/nodes", data=data,
+                                     headers={"X-Pod-Secret": os.environ.get("POD_SECRET", "")})
+        urllib.request.urlopen(req, timeout=10)
+        break
+    except Exception:
+        time.sleep(5)
+PY
+nohup python3 /tmp/nodespush.py >/dev/null 2>&1 &
 
 report ready "engine online at ${TSIP} with ${N} worker(s)"
 echo "READY at ${TSIP}"
