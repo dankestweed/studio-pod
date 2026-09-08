@@ -51,7 +51,7 @@ report models "syncing models"
 # models live on the volume (/workspace): fits the growing library and survives Stop->Resume
 mkdir -p /workspace/Models
 rclone sync storagebox:models /workspace/Models --transfers 8 --checkers 16 --fast-list \
-  --stats 10s --stats-one-line --log-level NOTICE --log-file /tmp/rclone-sync.log &
+  --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
 SYNC_PID=$!
 ( while kill -0 "$SYNC_PID" 2>/dev/null; do
     sleep 10
