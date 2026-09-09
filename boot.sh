@@ -233,6 +233,36 @@ for _ in range(60):
 PY
 nohup python3 /tmp/nodespush.py >/dev/null 2>&1 &
 
+# import-failure truth: the engine's own startup verdict on every custom node pack.
+# Grep the log at +60s and +180s and post home (empty list clears a previous session's fails).
+cat > /tmp/importfails.py <<'PY'
+import json, os, re, time, urllib.request, urllib.parse
+def collect():
+    fails, seen = [], set()
+    try:
+        log = open("/var/log/swarmui.log", errors="ignore").read()
+    except Exception:
+        return fails
+    for m in re.finditer(r"Cannot import (\S*custom_nodes/([^/\s:]+))[^:]*: ?(.*)", log):
+        name, reason = m.group(2), m.group(3).strip()[:200]
+        if name not in seen:
+            seen.add(name); fails.append({"pack": name, "reason": reason})
+    for m in re.finditer(r"IMPORT FAILED[:\s]+([\w .-]{2,60})", log):
+        name = m.group(1).strip()
+        if name and name not in seen:
+            seen.add(name); fails.append({"pack": name, "reason": ""})
+    return fails
+for wait in (60, 120):
+    time.sleep(wait)
+    data = urllib.parse.urlencode({"payload": json.dumps(collect())}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(os.environ.get("PORTAL_URL", "") + "/api/pod/importfails",
+            data=data, headers={"X-Pod-Secret": os.environ.get("POD_SECRET", "")}), timeout=8)
+    except Exception:
+        pass
+PY
+nohup python3 /tmp/importfails.py >/dev/null 2>&1 &
+
 report ready "engine online at ${TSIP} with ${N} worker(s)"
 echo "READY at ${TSIP}"
 sleep infinity
