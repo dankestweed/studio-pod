@@ -84,7 +84,9 @@ kill "$PROG_PID" 2>/dev/null || true
 report engine "starting the trainer"
 export HF_HOME=/workspace/hf
 export NODE_ENV=production
-export AI_TOOLKIT_AUTH="${AI_TOOLKIT_AUTH:-${POD_SECRET:-}}"
+# no AI_TOOLKIT_AUTH: unset disables the UI's own login ("approve all requests" in its
+# middleware) — the portal's Caddy forward_auth gate is the auth layer, and 8675 is
+# only reachable over the tailnet. Set AI_TOOLKIT_AUTH in the deploy env to re-enable.
 [ -n "${HF_TOKEN:-}" ] && export HF_TOKEN
 cd /app/ai-toolkit/ui
 nohup npm run start > /var/log/aitoolkit.log 2>&1 &
