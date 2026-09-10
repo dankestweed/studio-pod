@@ -1,0 +1,16 @@
+# Train pod image: ostris/ai-toolkit (torch 2.13 / cu130, UI on 8675) + the same
+# plumbing the studio image has (tailscale, rclone, boot script) so it joins the
+# portal flow: phone-home stages, storage box sync, private-network routing.
+# Pinned like nodes.txt: bump the tag deliberately, never track :latest.
+# NOTE: cu130 wheels need NVIDIA driver >= 580 on the host — deploy this image
+# to current-gen hosts only (RTX 5090 / RTX PRO 6000 lane).
+FROM ostris/aitoolkit:0.13.6
+ENV DEBIAN_FRONTEND=noninteractive
+# rclone + tailscale baked in (no boot-time installs); base already has
+# curl, openssh-server, python3, ffmpeg, rsync
+RUN curl -fsSL https://rclone.org/install.sh | bash && \
+    curl -fsSL https://tailscale.com/install.sh | sh
+COPY boot-train.sh /studio/boot-train.sh
+RUN chmod +x /studio/boot-train.sh
+EXPOSE 22 8675
+ENTRYPOINT ["/bin/bash", "/studio/boot-train.sh"]
