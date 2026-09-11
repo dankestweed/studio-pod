@@ -19,3 +19,5 @@ https://github.com/TTPlanetPig/Comfyui_TTP_Toolset@c8889e40e90e293226cc6810c7d27
 https://github.com/ssitu/ComfyUI_UltimateSDUpscale@a5547db9e1d07d3318bb21e9e9c474f4c1e9c8df
 https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler@4490bd1f482e026674543386bb2a4d176da245b9
 https://github.com/crystian/ComfyUI-Crystools@2f18256c5b5063937106f29a8e0a7db3ae3869b7
+https://github.com/WASasquatch/was-node-suite-comfyui@1cd8d304eda256c412b8589ce1f00be3c61cf9ec
+https://github.com/EllangoK/ComfyUI-post-processing-nodes@c49a05254795403648f2c1774b6f5ea39f96e7d5
