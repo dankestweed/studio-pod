@@ -6,3 +6,16 @@ https://github.com/lbouaraba/ComfyUI-Krea2Edit@86f886dac23013d88996e3a2e99093ba4
 https://github.com/capitan01R/ComfyUI-Krea2T-Enhancer@85baaf0145b532ce3418b016cefca76f90648d6d
 https://github.com/pixaroma/ComfyUI-Pixaroma@56e32d1676cab6700c54e4bdd37925f10867b970
 https://github.com/rgthree/rgthree-comfy@2c5342a8cb0eaecaabf61435a5f37dd594c510ba
+https://github.com/chflame163/ComfyUI_LayerStyle@5ba939099b33f998ecfbd63dcbbf089925b64a47
+https://github.com/Jonseed/ComfyUI-Detail-Daemon@3394e44afea04ed0188fb37b21f0d9952469766b
+https://github.com/kijai/ComfyUI-KJNodes@57105374f47d0fbb49c9c3926fb981702e0a4b5c
+https://github.com/1038lab/ComfyUI-QwenVL@06c71e3cc97010a3c61e19a8152755e809e90d15
+https://github.com/yolain/ComfyUI-Easy-Use@450b1ce4ce43b2280521c87f5fa388a898fb2ad2
+https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch@00d4776c52d84ce150ce5fe50bf90f956db02a4c
+https://github.com/city96/ComfyUI-GGUF@6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+https://github.com/dchatel/comfyui_facetools@59566c54f4fb814dd94787d348f18635563e90a3
+https://github.com/ltdrdata/ComfyUI-Impact-Pack@429d0159ad429e64d2b3916e6e7be9c22d025c3c
+https://github.com/TTPlanetPig/Comfyui_TTP_Toolset@c8889e40e90e293226cc6810c7d27b9c17300da6
+https://github.com/ssitu/ComfyUI_UltimateSDUpscale@a5547db9e1d07d3318bb21e9e9c474f4c1e9c8df
+https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler@4490bd1f482e026674543386bb2a4d176da245b9
+https://github.com/crystian/ComfyUI-Crystools@2f18256c5b5063937106f29a8e0a7db3ae3869b7
