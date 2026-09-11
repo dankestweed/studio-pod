@@ -19,13 +19,16 @@ RUN git clone --depth 1 https://github.com/mcmonkeyprojects/SwarmUI.git . && \
     test -e src/bin/live_release
 # ComfyUI via SwarmUI's own installer, pin torch to cu128 (Blackwell-ready),
 # and pre-install the packages Swarm would otherwise fetch on first launch
+# (mediapipe: comfyui_facetools imports it but declares NO deps anywhere - found the hard way;
+#  frontend-package floor: silences the version-skew alert vs the ComfyUI backend)
 RUN export PATH="/SwarmUI/.dotnet:$PATH" && \
     bash launchtools/comfy-install-linux.sh nv && \
     COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
     "$COMFY_DIR/venv/bin/pip" install --no-cache-dir --force-reinstall \
         torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     "$COMFY_DIR/venv/bin/pip" install --no-cache-dir \
-        rembg onnxruntime matplotlib opencv-python-headless imageio-ffmpeg dill omegaconf diffusers ultralytics && \
+        rembg onnxruntime matplotlib opencv-python-headless imageio-ffmpeg dill omegaconf diffusers ultralytics \
+        mediapipe "comfyui-frontend-package>=1.51.10" && \
     { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
     rm -rf "$COMFY_DIR/.git" /root/.cache/pip
 # Custom ComfyUI nodes from nodes.txt, cloned at pinned commits and their pip
