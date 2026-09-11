@@ -40,7 +40,9 @@ RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI
       echo "== installing node: $name"; \
       git clone --quiet "$url" "$name" || exit 1; \
       if [ "$ref" != "$spec" ]; then git -C "$name" checkout --quiet "$ref" || exit 1; fi; \
-      if [ -f "$name/requirements.txt" ]; then "$COMFY_DIR/venv/bin/pip" install --no-cache-dir -r "$name/requirements.txt" || exit 1; fi; \
+      if [ -f "$name/requirements.txt" ]; then \
+        sed -i '\#git+https://github.com/facebookresearch/sam2#d' "$name/requirements.txt"; \
+        "$COMFY_DIR/venv/bin/pip" install --no-cache-dir -r "$name/requirements.txt" || exit 1; fi; \
       rm -rf "$name/.git"; \
     done < /studio/nodes.txt && \
     echo "== custom_nodes now: $(ls "$COMFY_DIR/custom_nodes")" && \
