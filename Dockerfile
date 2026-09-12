@@ -51,6 +51,12 @@ RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI
     echo "== custom_nodes now: $(ls "$COMFY_DIR/custom_nodes")" && \
     { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
     rm -rf /root/.cache/pip
+# QwenVL FP8 on CUDA<13 needs these exact pins (workflow author's verified set) -
+# installed LAST so no pack requirement can re-upgrade them; xformers out per same guide.
+RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
+    "$COMFY_DIR/venv/bin/pip" install --no-cache-dir --force-reinstall --no-deps \
+        "huggingface_hub==1.7.1" "transformers==5.3.0" "tokenizers==0.22.2" && \
+    { "$COMFY_DIR/venv/bin/pip" uninstall -y xformers 2>/dev/null || true; }
 COPY boot.sh /studio/boot.sh
 RUN chmod +x /studio/boot.sh
 EXPOSE 22 7801

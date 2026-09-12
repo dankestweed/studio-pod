@@ -97,6 +97,13 @@ if rclone lsd storagebox:custom_nodes >/dev/null 2>&1; then
     [ -f "$RQ" ] && "$PIPBIN" install -q -r "$RQ" 2>/dev/null || true
   done
 fi
+# pack-implied model paths: some packs (facetools) hard-code ComfyUI's OWN models dir,
+# sidestepping the SwarmUI model-root remap -> bridge those folders to the volume.
+CMODELS="$(dirname "$COMFY_MAIN")/models"
+for d in landmarks ultralytics; do
+  if [ -d "$CMODELS/$d" ] && [ -z "$(ls -A "$CMODELS/$d" 2>/dev/null)" ]; then rmdir "$CMODELS/$d"; fi
+  [ -e "$CMODELS/$d" ] || ln -sfn "/workspace/Models/$d" "$CMODELS/$d"
+done
 mkdir -p /SwarmUI/Data
 T=$(printf '\t')
 cat > /SwarmUI/Data/Settings.fds <<SET
