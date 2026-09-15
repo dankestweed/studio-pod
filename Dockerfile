@@ -4,7 +4,7 @@ FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl wget ca-certificates python3 python3-venv python3-pip gcc python3-dev \
-      openssh-server unzip ffmpeg libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 \
+      openssh-server unzip ffmpeg cmake g++ libgl1 libglib2.0-0 libxcb1 libsm6 libxext6 libxrender1 \
       libegl1 libglvnd0 libgles2 && \
     rm -rf /var/lib/apt/lists/*
 # rclone + tailscale baked in (no boot-time installs)
@@ -44,7 +44,7 @@ RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI
       git clone --quiet "$url" "$name" || exit 1; \
       if [ "$ref" != "$spec" ]; then git -C "$name" checkout --quiet "$ref" || exit 1; fi; \
       if [ -f "$name/requirements.txt" ]; then \
-        sed -i '\#git+https://github.com/facebookresearch/sam2#d' "$name/requirements.txt"; \
+        sed -i -e '\#git+https://github.com/facebookresearch/sam2#d' -e '/^decord/d' "$name/requirements.txt"; \
         "$COMFY_DIR/venv/bin/pip" install --no-cache-dir -r "$name/requirements.txt" || exit 1; fi; \
       rm -rf "$name/.git"; \
     done < /studio/nodes.txt && \

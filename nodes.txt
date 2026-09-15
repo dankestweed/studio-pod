@@ -21,3 +21,22 @@ https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler@4490bd1f482e026674543386bb
 https://github.com/crystian/ComfyUI-Crystools@2f18256c5b5063937106f29a8e0a7db3ae3869b7
 https://github.com/WASasquatch/was-node-suite-comfyui@1cd8d304eda256c412b8589ce1f00be3c61cf9ec
 https://github.com/EllangoK/ComfyUI-post-processing-nodes@c49a05254795403648f2c1774b6f5ea39f96e7d5
+# --- bake 2 (Sep 13): workflows 1-10 coverage, every repo source-grep-verified ---
+https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite@4d907bee61e92c2e65af3bd6383a4e4d356126d1
+https://github.com/kijai/ComfyUI-WanVideoWrapper@088128b224242e110d3906c6750e9a3a348a659b
+https://github.com/kijai/ComfyUI-segment-anything-2@0c35fff5f382803e2310103357b5e985f5437f32
+https://github.com/yolain/ComfyUI-Easy-Sam3@88fe578a1a5e03d95281197303d5d3a73fd5a089
+https://github.com/flybirdxx/ComfyUI-Qwen-TTS@c96e21027ae79bc9903863c55637456786313fd7
+https://github.com/cubiq/ComfyUI_FaceAnalysis@8846653446a6b13582da11793faf950325a398e0
+https://github.com/cubiq/ComfyUI_essentials@9d9f4bedfc9f0321c19faf71855e228c93bd0dc9
+https://github.com/ltdrdata/ComfyUI-Impact-Subpack@50c7b71a6a224734cc9b21963c6d1926816a97f1
+https://github.com/theUpsider/ComfyUI-Logic@214cfba933291be224156d37bc30c25742076b44
+https://github.com/pythongosssss/ComfyUI-Custom-Scripts@609f3afaa74b2f88ef9ce8d939626065e3247469
+https://github.com/chrisgoringe/cg-use-everywhere@50ae9f8c5d8b9538589663c90a15d4067a02969c
+https://github.com/eddyhhlure1Eddy/ComfyUI-MemoryCleaner@6ff10c1ec7aa25cce2e10311f004df60426cb1a7
+https://github.com/1hew/ComfyUI-1hewNodes@bd759eccfb03ddc25459818195892b21758bc326
+https://github.com/hmwl/ComfyUI_zip@06353c9b02fd1e0e6379bc673ad5afc139d862c3
+https://github.com/1x1r/comfyui-upscale-by-model@e2bd620df79d73463e4f15dbedd3837f4496e6fe
+https://github.com/orssorbit/ComfyUI-wanBlockswap@5fa2ec0fa55879fe43a33e762fff91fc2c553a67
+# WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
+https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
