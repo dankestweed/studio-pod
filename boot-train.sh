@@ -66,9 +66,28 @@ if [ -f /app/ai-toolkit/aitk_db.db ] && [ ! -L /app/ai-toolkit/aitk_db.db ]; the
 fi
 ln -sfn /workspace/aitk/aitk_db.db /app/ai-toolkit/aitk_db.db
 
+# session manifest: the portal says which dataset folders this session needs.
+# Any failure -> full (old behavior). /api/pod/manifest is per-kind (train secret -> train manifest).
+MODE=full
+DS_FILT=""
+curl -m 10 -s "${PORTAL_URL:-}/api/pod/manifest" -H "X-Pod-Secret: ${POD_SECRET:-}" -o /tmp/manifest.json || true
+if python3 - <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open("/tmp/manifest.json"))
+ds = [x.strip().strip("/") for x in (d.get("datasets") or []) if x.strip()]
+ok = d.get("mode") == "selected" and ds
+open("/tmp/ds.list", "w").write("".join(x + "/**\n" for x in ds))
+sys.exit(0 if ok else 1)
+PY
+then MODE=selected; DS_FILT="--include-from /tmp/ds.list"; fi
+
 # datasets down from the library (the "models" stage so the portal timeline works)
-report models "syncing datasets"
-rclone copy storagebox:datasets /workspace/datasets --transfers 8 --checkers 16 \
+if [ "$MODE" = selected ]; then
+  report models "syncing $(wc -l < /tmp/ds.list | tr -d ' ') selected dataset folder(s)"
+else
+  report models "syncing datasets"
+fi
+rclone copy storagebox:datasets /workspace/datasets $DS_FILT --transfers 8 --checkers 16 \
   --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
 SYNC_PID=$!
 ( while kill -0 "$SYNC_PID" 2>/dev/null; do
@@ -108,7 +127,7 @@ SESSION_TAG=$(date +%Y%m%d-%H%M%S)
 ( while true; do
     sleep 60
     rclone copy /workspace/datasets storagebox:datasets --exclude "*.tmp" 2>/dev/null || true
-    rclone copy storagebox:datasets /workspace/datasets 2>/dev/null || true
+    rclone copy storagebox:datasets /workspace/datasets $DS_FILT 2>/dev/null || true
     rclone copy /workspace/training "storagebox:training/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
   done ) &
 
