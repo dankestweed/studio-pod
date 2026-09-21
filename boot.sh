@@ -30,6 +30,32 @@ TSIP=$(tailscale ip -4 2>/dev/null | head -1)
 [ -n "$TSIP" ] || fail "no tailscale ip"
 report network "joined as ${TSIP}"
 
+# GPU gate: catch nvidia1-only device mappings and CUDA init failures BEFORE the
+# model sync burns time. The detail wording is load-bearing: "GPU"/"CUDA" in an
+# error stage triggers the portal's community-host auto-blacklist.
+report tools "checking GPU"
+if [ ! -e /dev/nvidia0 ]; then
+  fail "GPU never initialized (CUDA init failed / nvidia1-only mapping)"
+fi
+VPY=$(find /SwarmUI/dlbackend -path '*/ComfyUI/venv/bin/python' 2>/dev/null | head -1)
+[ -x "$VPY" ] || VPY=python3
+GPU_OK=""
+for i in $(seq 1 24); do
+  if "$VPY" -c "import torch; torch.cuda.init(); assert torch.cuda.device_count() > 0" 2>/dev/null; then
+    GPU_OK=1; break
+  fi
+  [ $((i % 6)) -eq 0 ] && report tools "waiting on CUDA init ($((i * 5))s)"
+  sleep 5
+done
+[ -n "$GPU_OK" ] || fail "GPU never initialized (CUDA init failed / nvidia1-only mapping)"
+report tools "GPU ok: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+
+# uplink probe: 10s Cloudflare pull so dead-network hosts self-identify on the
+# timeline before the sync starts crawling at 9 B/s
+BPS=$(curl -m 12 -s -o /dev/null -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null || echo 0)
+MBPS=$(awk -v b="${BPS%%.*}" 'BEGIN{printf "%.1f", b/1048576}')
+report tools "uplink ${MBPS} MiB/s"
+
 report storage "connecting library"
 echo "${SB_KEY_B64:?SB_KEY_B64 missing}" | base64 -d > /root/.ssh/storagebox
 chmod 600 /root/.ssh/storagebox
