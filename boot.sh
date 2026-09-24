@@ -34,8 +34,10 @@ report network "joined as ${TSIP}"
 # model sync burns time. The detail wording is load-bearing: "GPU"/"CUDA" in an
 # error stage triggers the portal's community-host auto-blacklist.
 report tools "checking GPU"
-if [ ! -e /dev/nvidia0 ]; then
-  fail "GPU never initialized (CUDA init failed / nvidia1-only mapping)"
+# any NVIDIA device node counts: on multi-GPU hosts the allocated GPU keeps its HOST
+# index (/dev/nvidia3 for slot 3), so requiring nvidia0 rejected 7 of 8 healthy rentals
+if ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+  fail "GPU never initialized (no NVIDIA device node)"
 fi
 VPY=$(find /SwarmUI/dlbackend -path '*/ComfyUI/venv/bin/python' 2>/dev/null | head -1)
 [ -x "$VPY" ] || VPY=python3
@@ -47,7 +49,7 @@ for i in $(seq 1 24); do
   [ $((i % 6)) -eq 0 ] && report tools "waiting on CUDA init ($((i * 5))s)"
   sleep 5
 done
-[ -n "$GPU_OK" ] || fail "GPU never initialized (CUDA init failed / nvidia1-only mapping)"
+[ -n "$GPU_OK" ] || fail "GPU never initialized (CUDA init failed after 120s)"
 report tools "GPU ok: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 
 # uplink probe: 10s Cloudflare pull so dead-network hosts self-identify on the
