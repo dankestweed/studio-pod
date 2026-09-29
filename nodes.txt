@@ -39,5 +39,11 @@ https://github.com/1x1r/comfyui-upscale-by-model@e2bd620df79d73463e4f15dbedd3837
 https://github.com/orssorbit/ComfyUI-wanBlockswap@5fa2ec0fa55879fe43a33e762fff91fc2c553a67
 # plain Int/Float literals for wf3/wf7 (replaces ComfyUI-Logic, whose keys are emoji-suffixed)
 https://github.com/M1kep/ComfyLiterals@bdddb08ca82d90d75d97b1d437a652e0284a32ac
+# --- bake 3 (Sep 28): Krea2 Ostris edit + Krea2 controlnet, RMBG, controlnet preprocessors, RES4LYF samplers ---
+https://github.com/ostris/ComfyUI-Krea2-Ostris-Edit@7756566160c4a1b24bb1bd9f0ff3ced1a83d7547
+https://github.com/facok/comfyui-krea2-controlnet@79ebfd3bd80d2180b334dd7ce57f3c9ddaa0848f
+https://github.com/1038lab/ComfyUI-RMBG@58f1947a11567a9f8b707223185570850e773856
+https://github.com/Fannovel16/comfyui_controlnet_aux@0cd290477128d42cdc3e76a826a402d866e8c684
+https://github.com/ClownsharkBatwing/RES4LYF@3d1d69da69ee47f7647d59e1bd0967e472fccc41
 # WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
 https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
