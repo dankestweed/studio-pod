@@ -45,5 +45,7 @@ https://github.com/facok/comfyui-krea2-controlnet@79ebfd3bd80d2180b334dd7ce57f3c
 https://github.com/1038lab/ComfyUI-RMBG@58f1947a11567a9f8b707223185570850e773856
 https://github.com/Fannovel16/comfyui_controlnet_aux@0cd290477128d42cdc3e76a826a402d866e8c684
 https://github.com/ClownsharkBatwing/RES4LYF@3d1d69da69ee47f7647d59e1bd0967e472fccc41
+# --- bake 4 (Sep 30): person mask for the SRPO skin-detailer workflow (mediapipe; already present) ---
+https://github.com/djbielejeski/a-person-mask-generator@d2587540ff7ce7154f3fddfbf01a8628d77bf3c9
 # WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
 https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
