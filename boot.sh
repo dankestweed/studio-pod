@@ -149,6 +149,9 @@ ${T}SDEmbeddingFolder: embeddings
 Performance:
 ${T}AllowGpuSpecificOptimizations: false
 SET
+# --cache-none: comfy keeps every loaded model in RAM between runs by default; the full
+# pipeline (qwen edit + krea + 2x QwenVL + SRPO) outgrew the pod RAM cgroup -> oom_kill.
+# (--cache-ram is no use here: it reads host RAM, not the container limit)
 N=${WORKERS:-1}; case "$N" in 1|2|3|4) ;; *) N=1;; esac
 : > /SwarmUI/Data/Backends.fds
 for i in $(seq 0 $((N-1))); do
@@ -160,7 +163,7 @@ ${T}enabled: true
 ${T}settings:
 ${T}${T}StartScript: ${COMFY_REL}
 ${T}${T}GPU_ID: 0
-${T}${T}ExtraArgs: --enable-cors-header
+${T}${T}ExtraArgs: --enable-cors-header --cache-none
 BEND
 done
 
