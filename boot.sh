@@ -1,303 +1,2741 @@
-#!/usr/bin/env bash
-# Studio pod entrypoint (baked into the image).
-# Env from the portal deploy: TS_AUTHKEY SB_KEY_B64 SB_USER SB_HOST
-#                             PORTAL_URL POD_SECRET WORKERS
-# RunPod injects: PUBLIC_KEY (for ssh)
-set -uo pipefail
-TSIP=""
-report() { curl -m 8 -s -X POST "${PORTAL_URL:-}/api/pod/status" \
-  -H "X-Pod-Secret: ${POD_SECRET:-}" \
-  --data-urlencode "stage=$1" --data-urlencode "detail=${2:-}" \
-  --data-urlencode "ts_ip=${TSIP}" >/dev/null 2>&1 || true; }
-fail() { report error "$1"; echo "FATAL: $1"; sleep infinity; }
-
-report tools "machine booted"
-
-# ssh for debugging (RunPod convention: PUBLIC_KEY env)
-mkdir -p /root/.ssh /run/sshd
-[ -n "${PUBLIC_KEY:-}" ] && echo "${PUBLIC_KEY}" >> /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
-/usr/sbin/sshd 2>/dev/null || true
-
-report network "joining private network"
-mkdir -p /var/lib/tailscale
-pgrep tailscaled >/dev/null || nohup tailscaled --tun=userspace-networking \
-  --statedir=/var/lib/tailscale > /var/log/tailscaled.log 2>&1 &
-sleep 2
-tailscale up --authkey "${TS_AUTHKEY:?TS_AUTHKEY missing}" --hostname "gpu-pod${TENANT_SLUG:+-$TENANT_SLUG}" --timeout 60s \
-  || fail "tailscale join failed"
-TSIP=$(tailscale ip -4 2>/dev/null | head -1)
-[ -n "$TSIP" ] || fail "no tailscale ip"
-report network "joined as ${TSIP}"
-
-# GPU gate: catch nvidia1-only device mappings and CUDA init failures BEFORE the
-# model sync burns time. The detail wording is load-bearing: "GPU"/"CUDA" in an
-# error stage triggers the portal's community-host auto-blacklist.
-report tools "checking GPU"
-# any NVIDIA device node counts: on multi-GPU hosts the allocated GPU keeps its HOST
-# index (/dev/nvidia3 for slot 3), so requiring nvidia0 rejected 7 of 8 healthy rentals
-if ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
-  fail "GPU never initialized (no NVIDIA device node)"
-fi
-VPY=$(find /SwarmUI/dlbackend -path '*/ComfyUI/venv/bin/python' 2>/dev/null | head -1)
-[ -x "$VPY" ] || VPY=python3
-GPU_OK=""
-for i in $(seq 1 24); do
-  if "$VPY" -c "import torch; torch.cuda.init(); assert torch.cuda.device_count() > 0" 2>/dev/null; then
-    GPU_OK=1; break
-  fi
-  [ $((i % 6)) -eq 0 ] && report tools "waiting on CUDA init ($((i * 5))s)"
-  sleep 5
-done
-[ -n "$GPU_OK" ] || fail "GPU never initialized (CUDA init failed after 120s)"
-report tools "GPU ok: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-
-# uplink probe: 10s Cloudflare pull so dead-network hosts self-identify on the
-# timeline before the sync starts crawling at 9 B/s
-BPS=$(curl -m 12 -s -o /dev/null -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=104857600" 2>/dev/null || echo 0)
-MBPS=$(awk -v b="${BPS%%.*}" 'BEGIN{printf "%.1f", b/1048576}')
-report tools "uplink ${MBPS} MiB/s"
-
-report storage "connecting library"
-echo "${SB_KEY_B64:?SB_KEY_B64 missing}" | base64 -d > /root/.ssh/storagebox
-chmod 600 /root/.ssh/storagebox
-mkdir -p /root/.config/rclone
-cat > /root/.config/rclone/rclone.conf <<CONF
-[storagebox]
-type = sftp
-host = ${SB_HOST:?}
-user = ${SB_USER:?}
-port = 23
-key_file = /root/.ssh/storagebox
-shell_type = none
-CONF
-# a dead sftp stream must error out, never hang the boot or the sync loops
-export RCLONE_TIMEOUT=60s RCLONE_CONTIMEOUT=30s RCLONE_LOW_LEVEL_RETRIES=5
-rclone lsd storagebox: >/dev/null 2>&1 || fail "storage unreachable"
-
-# session manifest: the portal says whether this Start is a selected-workflows session
-# (sync only whats needed) or a full-library one. Any failure -> full (old behavior).
-MODE=full
-curl -m 10 -s "${PORTAL_URL:-}/api/pod/manifest" -H "X-Pod-Secret: ${POD_SECRET:-}" -o /tmp/manifest.json || true
-if python3 - <<'PY' 2>/dev/null
-import json, sys
-d = json.load(open("/tmp/manifest.json"))
-ok = d.get("mode") == "selected" and d.get("models")
-open("/tmp/models.list", "w").write("".join(m + "\n" for m in d.get("models") or []))
-open("/tmp/wf.list", "w").write("".join(w + "\n" for w in d.get("workflows") or []))
-sys.exit(0 if ok else 1)
-PY
-then MODE=selected; fi
-
-# models live on the volume (/workspace): fits the growing library and survives Stop->Resume
-mkdir -p /workspace/Models
-if [ "$MODE" = selected ]; then
-  report models "syncing $(wc -l < /tmp/models.list | tr -d ' ') selected model(s)"
-  rclone copy storagebox:models /workspace/Models --files-from /tmp/models.list --transfers 8 --checkers 16 \
-    --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
-else
-  report models "syncing models"
-  rclone sync storagebox:models /workspace/Models --transfers 8 --checkers 16 --fast-list \
-    --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
-fi
-SYNC_PID=$!
-( while kill -0 "$SYNC_PID" 2>/dev/null; do
-    sleep 10
-    L=$(grep -E '%,.*ETA' /tmp/rclone-sync.log 2>/dev/null | tail -1 | sed 's/^.*NOTICE:[[:space:]]*//' | tr -s ' ')
-    [ -z "$L" ] && L=$(grep 'NOTICE:' /tmp/rclone-sync.log 2>/dev/null | tail -1 | sed 's/^.*NOTICE:[[:space:]]*//' | tr -s ' ')
-    [ -n "$L" ] && report models "${L}"
-  done ) &
-PROG_PID=$!
-wait "$SYNC_PID" || report models "sync warnings (continuing)"
-kill "$PROG_PID" 2>/dev/null || true
-
-report engine "configuring ${WORKERS:-1} worker(s)"
-COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)
-COMFY_REL=${COMFY_MAIN#/SwarmUI/}
-# custom nodes: library custom_nodes/ -> ComfyUI (add-only) + their pip requirements, before the engine loads
-if rclone lsd storagebox:custom_nodes >/dev/null 2>&1; then
-  report engine "installing custom nodes"
-  CN_DIR="$(dirname "$COMFY_MAIN")/custom_nodes"
-  rclone copy storagebox:custom_nodes "$CN_DIR" 2>/dev/null || true
-  PIPBIN="$(dirname "$COMFY_MAIN")/venv/bin/pip"
-  [ -x "$PIPBIN" ] || PIPBIN=pip
-  for RQ in "$CN_DIR"/*/requirements.txt; do
-    [ -f "$RQ" ] && "$PIPBIN" install -q -r "$RQ" 2>/dev/null || true
-  done
-fi
-# pack-implied model paths: some packs (facetools) hard-code ComfyUI's OWN models dir,
-# sidestepping the SwarmUI model-root remap -> bridge those folders to the volume.
-CMODELS="$(dirname "$COMFY_MAIN")/models"
-for d in landmarks ultralytics; do
-  if [ -d "$CMODELS/$d" ] && [ -z "$(ls -A "$CMODELS/$d" 2>/dev/null)" ]; then rmdir "$CMODELS/$d"; fi
-  [ -e "$CMODELS/$d" ] || ln -sfn "/workspace/Models/$d" "$CMODELS/$d"
-done
-mkdir -p /SwarmUI/Data
-T=$(printf '\t')
-cat > /SwarmUI/Data/Settings.fds <<SET
-IsInstalled: true
-Network:
-${T}Host: 0.0.0.0
-Paths:
-${T}ModelRoot: /workspace/Models
-${T}SDModelFolder: checkpoints
-${T}SDLoraFolder: loras
-${T}SDVAEFolder: vae
-${T}SDEmbeddingFolder: embeddings
-SET
-N=${WORKERS:-1}; case "$N" in 1|2|3|4) ;; *) N=1;; esac
-: > /SwarmUI/Data/Backends.fds
-for i in $(seq 0 $((N-1))); do
-cat >> /SwarmUI/Data/Backends.fds <<BEND
-${i}:
-${T}type: comfyui_selfstart
-${T}title: worker-${i}
-${T}enabled: true
-${T}settings:
-${T}${T}StartScript: ${COMFY_REL}
-${T}${T}GPU_ID: 0
-${T}${T}ExtraArgs: --enable-cors-header
-BEND
-done
-
-report engine "starting the engine"
-cd /SwarmUI
-export PATH="/SwarmUI/.dotnet:$PATH"
-nohup ./launch-linux.sh --host 0.0.0.0 --launch_mode none > /var/log/swarmui.log 2>&1 &
-
-code=""
-for i in $(seq 1 120); do
-  code=$(curl -m 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7801/" || true)
-  case "$code" in 200|302) break;; esac
-  [ $((i % 6)) -eq 0 ] && report engine "waited $((i * 5))s for first response"
-  sleep 5
-done
-case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/swarmui.log)";; esac
-
-sleep 8
-# reference images: library inputs/ <-> ComfyUI input/ (copy both ways, never delete)
-COMFY_INPUT="$(dirname "$COMFY_MAIN")/input"
-mkdir -p "$COMFY_INPUT"
-rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
-# rescue generated outputs: raw comfy-tab saves land on the pod, not the VPS -> push
-# them home every minute into a per-session folder (comfy renumbers from 00001 each
-# session, so a shared folder would overwrite across sessions)
-SESSION_TAG=$(date +%Y%m%d-%H%M%S)
-COMFY_OUT="$(dirname "$COMFY_MAIN")/output"
-mkdir -p "$COMFY_OUT" /SwarmUI/Output
-
-# workflows: library workflows/ <-> ComfyUI's native workflow browser (two-way, never delete)
-COMFY_WF="$(dirname "$COMFY_MAIN")/user/default/workflows"
-mkdir -p "$COMFY_WF"
-WF_SEL=""; [ "$MODE" = selected ] && [ -s /tmp/wf.list ] && WF_SEL="--files-from /tmp/wf.list"
-# selected sessions get ONLY their chosen workflows (unvalidated ones must not open on the pod)
-rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
-( while true; do
-    sleep 60
-    rclone copy "$COMFY_INPUT" storagebox:inputs --exclude "*.tmp" --exclude "clipspace/**" 2>/dev/null || true
-    rclone copy storagebox:inputs "$COMFY_INPUT" 2>/dev/null || true
-    rclone copy "$COMFY_WF" storagebox:workflows --exclude "*.tmp" 2>/dev/null || true
-    rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
-    rclone copy "$COMFY_OUT" "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
-    rclone copy /SwarmUI/Output "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
-  done ) &
-
-# live metrics for the dashboard dials, every 4s
-( while true; do
-    G=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
-    IFS=, read -r GU VU VT GT <<< "${G:-,,,}"
-    read -r RU RT <<< "$(free -m | awk '/Mem:/ {print $3, $2}')"
-    read -r DU DT <<< "$(df -m /workspace 2>/dev/null | awk 'NR==2 {print $3, $2}')"
-    [ -z "$DT" ] && read -r DU DT <<< "$(df -m / | awk 'NR==2 {print $3, $2}')"
-    curl -m 5 -s -X POST "${PORTAL_URL:-}/api/pod/metrics" -H "X-Pod-Secret: ${POD_SECRET:-}" \
-      --data-urlencode "gpu=${GU}" --data-urlencode "vram_used=${VU}" --data-urlencode "vram_total=${VT}" \
-      --data-urlencode "temp=${GT}" --data-urlencode "ram_used=${RU}" --data-urlencode "ram_total=${RT}" \
-      --data-urlencode "disk_used=${DU}" --data-urlencode "disk_total=${DT}" >/dev/null 2>&1 || true
-    sleep 4
-  done ) &
-
-# generation timings for the dashboard strip: poll each worker's queue/history, post every 10s
-cat > /tmp/genpoll.py <<'PY'
-import json, os, time, urllib.request, urllib.parse
-PORTAL = os.environ.get("PORTAL_URL", ""); SECRET = os.environ.get("POD_SECRET", "")
-def get(u):
-    try:
-        with urllib.request.urlopen(u, timeout=4) as r: return json.load(r)
-    except Exception: return None
-while True:
-    runs, running, pending = [], 0, 0
-    for p in range(7821, 7829):
-        q = get(f"http://127.0.0.1:{p}/queue")
-        if q is None: continue
-        running += len(q.get("queue_running") or []); pending += len(q.get("queue_pending") or [])
-        h = get(f"http://127.0.0.1:{p}/history?max_items=8") or {}
-        for rec in h.values():
-            st = rec.get("status") or {}
-            ts = {}
-            for m in st.get("messages") or []:
-                if isinstance(m, list) and len(m) > 1 and isinstance(m[1], dict) and m[1].get("timestamp"):
-                    ts[m[0]] = m[1]["timestamp"]
-            a, b = ts.get("execution_start"), ts.get("execution_success") or ts.get("execution_error")
-            if a and b:
-                runs.append({"t": b/1000.0, "seconds": round((b-a)/1000.0, 1),
-                             "worker": p-7821, "ok": st.get("status_str") == "success"})
-    runs.sort(key=lambda r: -r["t"])
-    data = urllib.parse.urlencode({"payload": json.dumps({"runs": runs[:6], "running": running, "pending": pending})}).encode()
-    try:
-        urllib.request.urlopen(urllib.request.Request(PORTAL + "/api/pod/gens", data=data,
-                                                      headers={"X-Pod-Secret": SECRET}), timeout=5)
-    except Exception: pass
-    time.sleep(10)
-PY
-nohup python3 /tmp/genpoll.py >/dev/null 2>&1 &
-
-# node registry: once a worker answers, push the full class list home (arms pre-flight node checks)
-cat > /tmp/nodespush.py <<'PY'
-import json, os, time, urllib.request, urllib.parse
-for _ in range(60):
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:7821/object_info", timeout=8) as r:
-            classes = sorted(json.load(r).keys())
-        data = urllib.parse.urlencode({"payload": json.dumps(classes)}).encode()
-        req = urllib.request.Request(os.environ.get("PORTAL_URL", "") + "/api/pod/nodes", data=data,
-                                     headers={"X-Pod-Secret": os.environ.get("POD_SECRET", "")})
-        urllib.request.urlopen(req, timeout=10)
-        break
-    except Exception:
-        time.sleep(5)
-PY
-nohup python3 /tmp/nodespush.py >/dev/null 2>&1 &
-
-# import-failure truth: the engine's own startup verdict on every custom node pack.
-# Grep the log at +60s and +180s and post home (empty list clears a previous session's fails).
-cat > /tmp/importfails.py <<'PY'
-import json, os, re, time, urllib.request, urllib.parse
-def collect():
-    fails, seen = [], set()
-    try:
-        log = open("/var/log/swarmui.log", errors="ignore").read()
-    except Exception:
-        return fails
-    for m in re.finditer(r"Cannot import (\S*custom_nodes/([^/\s:]+))[^:]*: ?(.*)", log):
-        name, reason = m.group(2), m.group(3).strip()[:200]
-        if name not in seen:
-            seen.add(name); fails.append({"pack": name, "reason": reason})
-    for m in re.finditer(r"IMPORT FAILED[:\s]+([\w .-]{2,60})", log):
-        name = m.group(1).strip()
-        if name and name not in seen:
-            seen.add(name); fails.append({"pack": name, "reason": ""})
-    return fails
-for wait in (60, 120):
-    time.sleep(wait)
-    data = urllib.parse.urlencode({"payload": json.dumps(collect())}).encode()
-    try:
-        urllib.request.urlopen(urllib.request.Request(os.environ.get("PORTAL_URL", "") + "/api/pod/importfails",
-            data=data, headers={"X-Pod-Secret": os.environ.get("POD_SECRET", "")}), timeout=8)
-    except Exception:
-        pass
-PY
-nohup python3 /tmp/importfails.py >/dev/null 2>&1 &
-
-report ready "engine online at ${TSIP} with ${N} worker(s)"
-echo "READY at ${TSIP}"
-sleep infinity
+{
+  "id": "54bb395d-3e60-4c94-b525-85523901575b",
+  "revision": 0,
+  "last_node_id": 505,
+  "last_link_id": 903,
+  "nodes": [
+    {
+      "id": 459,
+      "type": "bc1c967a-7f6a-4be9-a372-dad16e4f28e3",
+      "pos": [
+        480,
+        2420
+      ],
+      "size": [
+        420,
+        760
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "positive_prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "label": "refine_prompt",
+          "name": "switch_1",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "switch_1"
+          },
+          "link": null
+        },
+        {
+          "label": "steps",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "label": "custom_size",
+          "name": "switch",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "switch"
+          },
+          "link": null
+        },
+        {
+          "label": "sampler",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "label": "scheduler",
+          "name": "scheduler_1",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler_1"
+          },
+          "link": null
+        },
+        {
+          "label": "cache_device",
+          "name": "device",
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          },
+          "link": null
+        },
+        {
+          "label": "dtype",
+          "name": "dtype",
+          "type": "COMBO",
+          "widget": {
+            "name": "dtype"
+          },
+          "link": null
+        },
+        {
+          "label": "PE_model",
+          "name": "clip_name_1",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name_1"
+          },
+          "link": null
+        },
+        {
+          "label": "image_1",
+          "name": "images.image_1",
+          "type": "IMAGE",
+          "link": 704
+        },
+        {
+          "label": "image_2",
+          "name": "images.image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_3",
+          "name": "images.image_3",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_4",
+          "name": "images.image_4",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_5",
+          "name": "images.image_5_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_6",
+          "name": "images.image_6",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_7",
+          "name": "images.image_7",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_8",
+          "name": "images.image_8",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_9",
+          "name": "images.image_9",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "image_10",
+          "name": "images.image_10",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            672
+          ]
+        }
+      ],
+      "properties": {
+        "previewExposures": []
+      },
+      "widgets_values": [
+        2048,
+        "Keep everything in <image1> exactly the same: the same woman with the same face, hair and makeup; the same outfit with every garment, color, pattern, fabric, fit and detail unchanged; the same room, background, furniture, objects, lighting and color grading; the same camera position and framing. Change only her pose: she is now sitting on the edge of the bed, leaning back on both hands, looking at the camera. It stays a realistic, unedited phone photo.",
+        false,
+        false,
+        4096,
+        "",
+        1,
+        25,
+        false,
+        1024,
+        1024,
+        "euler",
+        "simple",
+        891836227295375,
+        "qwen_image_2.1_int8_convrot.safetensors",
+        "qwen3vl_8b_int8_convrot.safetensors",
+        "qwen_image_2.1_vae_bf16.safetensors",
+        "auto",
+        "default",
+        "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors"
+      ],
+      "widgets_values_named": {
+        "resolution": 0,
+        "prompt": "Replace costumes for the character",
+        "switch_1": false,
+        "thinking": false,
+        "max_length": 4096,
+        "negative_prompt": "",
+        "cfg": 1,
+        "steps": 25,
+        "switch": false,
+        "width": 1024,
+        "height": 1024,
+        "scheduler": "euler",
+        "scheduler_1": "simple",
+        "seed": 891836227295375,
+        "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+        "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+        "vae_name": "qwen_image_2.1_vae_bf16.safetensors",
+        "device": "auto",
+        "dtype": "default",
+        "clip_name_1": "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors"
+      }
+    },
+    {
+      "id": 461,
+      "type": "SaveImageAdvanced",
+      "pos": [
+        1410,
+        2420
+      ],
+      "size": [
+        710,
+        760
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "showAdvanced": true,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 672
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            708
+          ]
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "QwenEdit21_pose",
+        "png",
+        "8-bit",
+        "sRGB"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "Qwen_image_2.1",
+        "format": "png",
+        "format.bit_depth": "8-bit",
+        "format.input_color_space": "sRGB"
+      }
+    },
+    {
+      "id": 463,
+      "type": "MarkdownNote",
+      "pos": [
+        -360,
+        2410
+      ],
+      "size": [
+        420,
+        620
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note: how to use this test",
+      "properties": {},
+      "widgets_values": [
+        "## Qwen-Image 2.1 pose/angle test (KKCG)\n**Licence: Qwen Research Licence = evaluation only. Nothing from this workflow goes to commercial use until licensed.**\n\n1. Load a finished image in **INPUT**.\n2. In the Image Edit node's prompt, edit ONLY the `Change only her pose:` sentence. Keep the long \"keep everything the same\" part.\n   - Camera angle instead: replace that sentence with e.g. `Change only the camera angle: the same moment photographed from her left side at eye level.`\n   - Action: `Change only what she is doing: she is now drinking from a coffee mug held in both hands.`\n3. Never write mirror / reflection / mirror selfie (draws a second person).\n4. resolution 2048 = ~4 MP native 2K canvas at the input's aspect ratio. 1024 for fast drafts.\n5. steps 25 / cfg 1 / euler / simple = official. Pose changes rewrite the whole frame, so don't drop steps. 40 if hands fizzle.\n6. refine_prompt (prompt enhancer) is OFF. Try it ON as a second test.\n\nJudge: clothes and background identical? face still hers? Face/skin passes get added only if the edit itself holds."
+      ],
+      "widgets_values_named": {
+        "text": "## Size\nQwen Image 2.1 has native 2K (2048*2048) support for direct output.\n\n- resolution is a total pixel budget (not width or height). Aspect ratio is preserved.\n- Official default is 1024. The model supports up to 2048.\n- This template starts at 0: no resize beyond a multiple of 32.\n- Output follows image_1. Extra refs can differ in size or aspect.\n- custom_size off: canvas comes from the encode latent (image_1).\n- custom_size on: use ResolutionSelector width/height. Keep it close to the resized image_1 size, or the edit can shift.\n\n## Reference images\n- Up to 10 reference images (image_1 to image_10).\n- Mention them in the prompt as `<image1>`, `<image2>`, ...\n- image_1 is the edit target. The rest are references.\n\n## Custom settings\nIf you need custom settings, enter or unpack the subgraph to edit it. See the [Subgraph](https://docs.comfy.org/interface/features/subgraph) guide.\n\n## Parameters\n- prompt: edit instruction. Use `<image1>` ... `<image10>`.\n- negative_prompt: unused while cfg is 1.\n- cfg: keep 1 for the Qwen Image 2.1 official path. Raise it only if you use a negative prompt.\n- steps: Qwen Image 2.1 official pipeline uses about 40-50 with euler. This template starts at 25. More advanced samplers need fewer steps."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 470,
+      "type": "LoadImage",
+      "pos": [
+        140,
+        2420
+      ],
+      "size": [
+        290,
+        110
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            704,
+            707
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "portrait_model_denim.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "portrait_model_denim.png",
+        "upload": "image"
+      },
+      "title": "INPUT — your finished image (image_1)"
+    },
+    {
+      "id": 472,
+      "type": "ImageCompare",
+      "pos": [
+        2160,
+        2420
+      ],
+      "size": [
+        660,
+        760
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image_a",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 707
+        },
+        {
+          "name": "image_b",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 708
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "ImageCompare"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {},
+      "title": "original | edited"
+    },
+    {
+      "id": 476,
+      "type": "MarkdownNote",
+      "pos": [
+        -840,
+        2410
+      ],
+      "size": [
+        420,
+        620
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note: Model links",
+      "properties": {},
+      "widgets_values": [
+        "Guide: [Subgraph](https://docs.comfy.org/interface/features/subgraph)\n\n## Input Assets\n\n- [portrait_model_denim.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/input/portrait_model_denim.png)\n- [clothing_light_blue_denim_shirt.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/input/clothing_light_blue_denim_shirt.png)\n\n\n## Model Links\n\n- [Hugging Face:Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)\n- [ModelScope:Comfy-Org/Qwen-Image-2.1](https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1)\n\n**diffusion_models**\n\n- [qwen_image_2.1_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_bf16.safetensors) (13.25 GB)\n- [qwen_image_2.1_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors) (6.76 GB)\n\n**text_encoders**\n\n- [qwen3vl_8b_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_bf16.safetensors) (16.33 GB)\n- [qwen3vl_8b_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors) (8.71 GB) \n- [qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors) (8.82 GB)\n\n**vae**\n\n- [qwen_image_2.1_vae_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors) (644.2 MB)\n\n\n## Model Storage Location\n\n```\n📂 ComfyUI/\n├── 📂 models/\n│   ├── 📂 diffusion_models/\n│   │   ├── qwen_image_2.1_bf16.safetensors\n│   │   └── qwen_image_2.1_int8_convrot.safetensors\n│   ├── 📂 text_encoders/\n│   │   ├── qwen3vl_8b_bf16.safetensors\n│   │   ├── qwen3vl_8b_int8_convrot.safetensors\n│   │   └── qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors│   └── 📂 vae/\n│       └── qwen_image_2.1_vae_bf16.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/comfyanonymous/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
+      ],
+      "widgets_values_named": {
+        "text": "Guide: [Subgraph](https://docs.comfy.org/interface/features/subgraph)\n\n## Input Assets\n\n- [portrait_model_denim.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/input/portrait_model_denim.png)\n- [clothing_light_blue_denim_shirt.png](https://raw.githubusercontent.com/Comfy-Org/workflow_templates/refs/heads/main/input/clothing_light_blue_denim_shirt.png)\n\n\n## Model Links\n\n- [Hugging Face:Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)\n- [ModelScope:Comfy-Org/Qwen-Image-2.1](https://modelscope.cn/models/Comfy-Org/Qwen-Image-2.1)\n\n**diffusion_models**\n\n- [qwen_image_2.1_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_bf16.safetensors) (13.25 GB)\n- [qwen_image_2.1_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors) (6.76 GB)\n\n**text_encoders**\n\n- [qwen3vl_8b_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_bf16.safetensors) (16.33 GB)\n- [qwen3vl_8b_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors) (8.71 GB) \n- [qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors) (8.82 GB)\n\n**vae**\n\n- [qwen_image_2.1_vae_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors) (644.2 MB)\n\n\n## Model Storage Location\n\n```\n📂 ComfyUI/\n├── 📂 models/\n│   ├── 📂 diffusion_models/\n│   │   ├── qwen_image_2.1_bf16.safetensors\n│   │   └── qwen_image_2.1_int8_convrot.safetensors\n│   ├── 📂 text_encoders/\n│   │   ├── qwen3vl_8b_bf16.safetensors\n│   │   ├── qwen3vl_8b_int8_convrot.safetensors\n│   │   └── qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors│   └── 📂 vae/\n│       └── qwen_image_2.1_vae_bf16.safetensors\n```\n\n## Report Issue\n\nNote: Please update ComfyUI first ([guide](https://docs.comfy.org/installation/update_comfyui)) and prepare required models. Desktop/Cloud updates follow stable releases, so some nightly-supported models may not be available yet.\n\n- Cannot run / runtime errors: [ComfyUI/issues](https://github.com/comfyanonymous/ComfyUI/issues)\n- UI / frontend issues: [ComfyUI_frontend/issues](https://github.com/Comfy-Org/ComfyUI_frontend/issues)\n- Workflow issues: [workflow_templates/issues](https://github.com/Comfy-Org/workflow_templates/issues)\n"
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 501,
+      "type": "MarkdownNote",
+      "pos": [
+        920,
+        2730
+      ],
+      "size": [
+        420,
+        480
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Note: PE",
+      "properties": {},
+      "widgets_values": [
+        "## Prompt Enhancer\n\nThe prompt enhancer rewrites your instruction with the Qwen 3.5 prompt enhancer model before the edit model sees it. These settings follow the official prompt enhancer release, and the ones you are most likely to change are exposed on the node.\n\n- `refine_prompt`: on runs the rewrite and feeds it to the edit model, off passes your instruction through as written. On gives the edit model a fuller prompt and usually better results; off skips the rewrite pass and the run finishes faster. This template starts with it off.\n- `thinking`: turn this on together with the enhancer. The checkpoint was trained with a reasoning block and loses quality without it.\n- `max_length`: the token budget for the reasoning block plus the rewritten prompt, 4096 here. The official setting is 24000; this template caps it lower so a single rewrite cannot run for many minutes.\n- `sampling_mode`: the sampling values live inside the subgraph. They follow the official ones: `temperature` 1.0, `top_p` 0.95, `top_k` 20, `min_p` 0, `presence_penalty` 0, `repetition_penalty` 1.0.\n\nThe enhancer checkpoint and its system prompt live inside the subgraph."
+      ],
+      "widgets_values_named": {
+        "text": "## Prompt Enhancer\n\nThe prompt enhancer rewrites your instruction with the Qwen 3.5 prompt enhancer model before the edit model sees it. These settings follow the official prompt enhancer release, and the ones you are most likely to change are exposed on the node.\n\n- `refine_prompt`: on runs the rewrite and feeds it to the edit model, off passes your instruction through as written. On gives the edit model a fuller prompt and usually better results; off skips the rewrite pass and the run finishes faster. This template starts with it off.\n- `thinking`: turn this on together with the enhancer. The checkpoint was trained with a reasoning block and loses quality without it.\n- `max_length`: the token budget for the reasoning block plus the rewritten prompt, 4096 here. The official setting is 24000; this template caps it lower so a single rewrite cannot run for many minutes.\n- `sampling_mode`: the sampling values live inside the subgraph. They follow the official ones: `temperature` 1.0, `top_p` 0.95, `top_k` 20, `min_p` 0, `presence_penalty` 0, `repetition_penalty` 1.0.\n\nThe enhancer checkpoint and its system prompt live inside the subgraph."
+      },
+      "color": "#222",
+      "bgcolor": "#000"
+    },
+    {
+      "id": 502,
+      "type": "UNETLoader",
+      "pos": [
+        140,
+        3300
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 502,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": []
+        }
+      ],
+      "title": "sync: qwen_image_2.1_int8_convrot.safetensors",
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "qwen_image_2.1_int8_convrot.safetensors",
+        "default"
+      ]
+    },
+    {
+      "id": 503,
+      "type": "CLIPLoader",
+      "pos": [
+        570,
+        3300
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 503,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": []
+        }
+      ],
+      "title": "sync: qwen3vl_8b_int8_convrot.safetensors",
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_8b_int8_convrot.safetensors",
+        "qwen_image",
+        "default"
+      ]
+    },
+    {
+      "id": 504,
+      "type": "CLIPLoader",
+      "pos": [
+        1000,
+        3300
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 504,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": []
+        }
+      ],
+      "title": "sync: qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+        "qwen_image",
+        "default"
+      ]
+    },
+    {
+      "id": 505,
+      "type": "VAELoader",
+      "pos": [
+        1430,
+        3300
+      ],
+      "size": [
+        400,
+        110
+      ],
+      "flags": {},
+      "order": 505,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": []
+        }
+      ],
+      "title": "sync: qwen_image_2.1_vae_bf16.safetensors",
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "qwen_image_2.1_vae_bf16.safetensors"
+      ]
+    }
+  ],
+  "links": [
+    [
+      707,
+      470,
+      0,
+      472,
+      0,
+      "IMAGE"
+    ],
+    [
+      708,
+      461,
+      0,
+      472,
+      1,
+      "IMAGE"
+    ],
+    [
+      704,
+      470,
+      0,
+      459,
+      9,
+      "IMAGE"
+    ],
+    [
+      672,
+      459,
+      0,
+      461,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 99,
+      "title": "PORTAL SYNC LIST · muted, never runs",
+      "bounding": [
+        120,
+        3220,
+        1760,
+        220
+      ],
+      "color": "#444",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "bc1c967a-7f6a-4be9-a372-dad16e4f28e3",
+        "version": 1,
+        "state": {
+          "lastGroupId": 38,
+          "lastNodeId": 501,
+          "lastLinkId": 903,
+          "lastRerouteId": 9
+        },
+        "revision": 0,
+        "config": {},
+        "name": "Image Edit (Qwen Image 2.1)",
+        "inputNode": {
+          "id": -10,
+          "bounding": [
+            -720,
+            630,
+            143.044921875,
+            648
+          ]
+        },
+        "outputNode": {
+          "id": -20,
+          "bounding": [
+            1960,
+            640,
+            128,
+            68
+          ]
+        },
+        "inputs": [
+          {
+            "id": "1f3911c3-71b5-45b7-9a0e-4ac7285069dc",
+            "name": "resolution",
+            "type": "INT",
+            "linkIds": [
+              725
+            ],
+            "pos": [
+              -600.955078125,
+              654
+            ]
+          },
+          {
+            "id": "6a73de3b-f4cd-43a4-9076-76648c6902f0",
+            "name": "prompt",
+            "type": "STRING",
+            "linkIds": [
+              739,
+              802
+            ],
+            "localized_name": "prompt",
+            "label": "positive_prompt",
+            "pos": [
+              -600.955078125,
+              674
+            ]
+          },
+          {
+            "id": "57887da4-f3f5-41b1-9fce-a7292abaef6a",
+            "name": "switch_1",
+            "type": "BOOLEAN",
+            "linkIds": [
+              741
+            ],
+            "label": "refine_prompt",
+            "pos": [
+              -600.955078125,
+              694
+            ]
+          },
+          {
+            "id": "cd079967-6ff0-46d9-8b58-d52c2cdc5de5",
+            "name": "thinking",
+            "type": "BOOLEAN",
+            "linkIds": [
+              902
+            ],
+            "pos": [
+              -600.955078125,
+              714
+            ]
+          },
+          {
+            "id": "d98ec6b1-9955-48e0-874d-b99d10218329",
+            "name": "max_length",
+            "type": "INT",
+            "linkIds": [
+              903
+            ],
+            "pos": [
+              -600.955078125,
+              734
+            ]
+          },
+          {
+            "id": "d4c1377f-7fbc-4519-b83c-9a3b9c2de104",
+            "name": "negative_prompt",
+            "type": "STRING",
+            "linkIds": [
+              727
+            ],
+            "pos": [
+              -600.955078125,
+              754
+            ]
+          },
+          {
+            "id": "420ee896-17c3-4e07-95fc-0ff309a6b836",
+            "name": "cfg",
+            "type": "FLOAT",
+            "linkIds": [
+              658
+            ],
+            "pos": [
+              -600.955078125,
+              774
+            ]
+          },
+          {
+            "id": "349c3f72-ba7a-4277-84ff-8029faa16019",
+            "name": "steps",
+            "type": "INT",
+            "linkIds": [
+              659
+            ],
+            "label": "steps",
+            "pos": [
+              -600.955078125,
+              794
+            ]
+          },
+          {
+            "id": "60df426d-f8ab-4ce2-8c82-42dc7cbf19d0",
+            "name": "switch",
+            "type": "BOOLEAN",
+            "linkIds": [
+              703
+            ],
+            "label": "custom_size",
+            "pos": [
+              -600.955078125,
+              814
+            ]
+          },
+          {
+            "id": "91c96cf8-057b-4da2-b71e-305541a3527e",
+            "name": "width",
+            "type": "INT",
+            "linkIds": [
+              660
+            ],
+            "localized_name": "width",
+            "pos": [
+              -600.955078125,
+              834
+            ]
+          },
+          {
+            "id": "661cc520-6bd0-4925-90ec-cecaa188b57d",
+            "name": "height",
+            "type": "INT",
+            "linkIds": [
+              661
+            ],
+            "localized_name": "height",
+            "pos": [
+              -600.955078125,
+              854
+            ]
+          },
+          {
+            "id": "9f0e91b8-5a4a-4f5a-a2a4-4ddc180df0fd",
+            "name": "scheduler",
+            "type": "COMBO",
+            "linkIds": [
+              662
+            ],
+            "label": "sampler",
+            "pos": [
+              -600.955078125,
+              874
+            ]
+          },
+          {
+            "id": "4710583f-3cb0-4091-87ab-dadd8a2e657c",
+            "name": "scheduler_1",
+            "type": "COMBO",
+            "linkIds": [
+              668
+            ],
+            "label": "scheduler",
+            "pos": [
+              -600.955078125,
+              894
+            ]
+          },
+          {
+            "id": "977ce57d-3764-491c-8d2d-543754cfbaf1",
+            "name": "seed",
+            "type": "INT",
+            "linkIds": [
+              667,
+              804
+            ],
+            "pos": [
+              -600.955078125,
+              914
+            ]
+          },
+          {
+            "id": "143494fb-a40e-423f-be3b-ecc808b408b0",
+            "name": "unet_name",
+            "type": "COMBO",
+            "linkIds": [
+              663
+            ],
+            "pos": [
+              -600.955078125,
+              934
+            ]
+          },
+          {
+            "id": "d8528289-e121-45ed-9c31-e6370ce4ba5e",
+            "name": "clip_name",
+            "type": "COMBO",
+            "linkIds": [
+              664
+            ],
+            "pos": [
+              -600.955078125,
+              954
+            ]
+          },
+          {
+            "id": "f03d1fb0-d592-4997-b55e-e7a2549c36e5",
+            "name": "vae_name",
+            "type": "COMBO",
+            "linkIds": [
+              665
+            ],
+            "pos": [
+              -600.955078125,
+              974
+            ]
+          },
+          {
+            "id": "c2d95dbf-7f92-4c0b-a138-b9b5d1472e7f",
+            "name": "device",
+            "type": "COMBO",
+            "linkIds": [
+              729
+            ],
+            "label": "cache_device",
+            "pos": [
+              -600.955078125,
+              994
+            ]
+          },
+          {
+            "id": "974d6751-be03-4afc-911f-a0d43f7cb906",
+            "name": "dtype",
+            "type": "COMBO",
+            "linkIds": [
+              730
+            ],
+            "label": "dtype",
+            "pos": [
+              -600.955078125,
+              1014
+            ]
+          },
+          {
+            "id": "c11b216a-e05d-49a4-b776-293022d01a52",
+            "name": "clip_name_1",
+            "type": "COMBO",
+            "linkIds": [
+              746
+            ],
+            "label": "PE_model",
+            "pos": [
+              -600.955078125,
+              1034
+            ]
+          },
+          {
+            "id": "6bbe4c8a-0ce9-4576-9468-697a165b98b4",
+            "name": "images.image_1",
+            "type": "IMAGE",
+            "linkIds": [
+              710,
+              750
+            ],
+            "label": "image_1",
+            "pos": [
+              -600.955078125,
+              1054
+            ]
+          },
+          {
+            "id": "5e9080e7-bbd0-4363-9e25-aaa201f9ff01",
+            "name": "images.image_2",
+            "type": "IMAGE",
+            "linkIds": [
+              711,
+              779
+            ],
+            "label": "image_2",
+            "pos": [
+              -600.955078125,
+              1074
+            ]
+          },
+          {
+            "id": "29bd6732-17d4-4ca7-aa9f-dc118c6c008a",
+            "name": "images.image_3",
+            "type": "IMAGE",
+            "linkIds": [
+              712,
+              780
+            ],
+            "label": "image_3",
+            "pos": [
+              -600.955078125,
+              1094
+            ]
+          },
+          {
+            "id": "c0899e22-8834-4c49-b0ec-5d2e1c9a4f9d",
+            "name": "images.image_4",
+            "type": "IMAGE",
+            "linkIds": [
+              713,
+              781
+            ],
+            "label": "image_4",
+            "pos": [
+              -600.955078125,
+              1114
+            ]
+          },
+          {
+            "id": "f4bb2fe2-583b-429d-83dc-0af6d4d3fdf8",
+            "name": "images.image_5_1",
+            "type": "IMAGE",
+            "linkIds": [
+              714,
+              782
+            ],
+            "label": "image_5",
+            "pos": [
+              -600.955078125,
+              1134
+            ]
+          },
+          {
+            "id": "4dc8dcc5-da5f-4dd4-82f4-479dabed8567",
+            "name": "images.image_6",
+            "type": "IMAGE",
+            "linkIds": [
+              715,
+              783
+            ],
+            "label": "image_6",
+            "pos": [
+              -600.955078125,
+              1154
+            ]
+          },
+          {
+            "id": "58ac7e94-91ff-4992-9022-fd67902782eb",
+            "name": "images.image_7",
+            "type": "IMAGE",
+            "linkIds": [
+              716,
+              784
+            ],
+            "label": "image_7",
+            "pos": [
+              -600.955078125,
+              1174
+            ]
+          },
+          {
+            "id": "b736a3f9-62a7-4b77-ad2b-9ed40a482949",
+            "name": "images.image_8",
+            "type": "IMAGE",
+            "linkIds": [
+              717,
+              785
+            ],
+            "label": "image_8",
+            "pos": [
+              -600.955078125,
+              1194
+            ]
+          },
+          {
+            "id": "79883453-5e79-4003-a7ef-8d9156cffcc4",
+            "name": "images.image_9",
+            "type": "IMAGE",
+            "linkIds": [
+              718,
+              786
+            ],
+            "label": "image_9",
+            "pos": [
+              -600.955078125,
+              1214
+            ]
+          },
+          {
+            "id": "68c8b3fa-d3fd-4281-82ba-09030a9918dc",
+            "name": "images.image_10",
+            "type": "IMAGE",
+            "linkIds": [
+              719,
+              787
+            ],
+            "label": "image_10",
+            "pos": [
+              -600.955078125,
+              1234
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": "f6f3effc-0961-4c17-b52c-a77c16ca6aa4",
+            "name": "IMAGE",
+            "type": "IMAGE",
+            "linkIds": [
+              650
+            ],
+            "localized_name": "IMAGE",
+            "pos": [
+              1984,
+              664
+            ]
+          }
+        ],
+        "widgets": [],
+        "nodes": [
+          {
+            "id": 451,
+            "type": "UNETLoader",
+            "pos": [
+              -190,
+              410
+            ],
+            "size": [
+              510,
+              90
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "unet_name",
+                "name": "unet_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "unet_name"
+                },
+                "link": 663
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "MODEL",
+                "name": "MODEL",
+                "type": "MODEL",
+                "links": [
+                  688
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "UNETLoader",
+              "models": [
+                {
+                  "name": "qwen_image_2.1_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+                  "directory": "diffusion_models"
+                }
+              ]
+            },
+            "widgets_values": [
+              "qwen_image_2.1_int8_convrot.safetensors",
+              "default"
+            ],
+            "widgets_values_named": {
+              "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+              "weight_dtype": "default"
+            }
+          },
+          {
+            "id": 453,
+            "type": "CLIPLoader",
+            "pos": [
+              -190,
+              570
+            ],
+            "size": [
+              510,
+              120
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "clip_name",
+                "name": "clip_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "clip_name"
+                },
+                "link": 664
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "CLIP",
+                "name": "CLIP",
+                "type": "CLIP",
+                "links": [
+                  721
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "CLIPLoader",
+              "models": [
+                {
+                  "name": "qwen3vl_8b_int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
+            },
+            "widgets_values": [
+              "qwen3vl_8b_int8_convrot.safetensors",
+              "qwen_image",
+              "default"
+            ],
+            "widgets_values_named": {
+              "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+              "type": "qwen_image",
+              "device": "default"
+            }
+          },
+          {
+            "id": 454,
+            "type": "VAELoader",
+            "pos": [
+              -190,
+              770
+            ],
+            "size": [
+              510,
+              70
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "vae_name",
+                "name": "vae_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "vae_name"
+                },
+                "link": 665
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "VAE",
+                "name": "VAE",
+                "type": "VAE",
+                "links": [
+                  649,
+                  720
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "VAELoader",
+              "models": [
+                {
+                  "name": "qwen_image_2.1_vae_bf16.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
+                  "directory": "vae"
+                }
+              ]
+            },
+            "widgets_values": [
+              "qwen_image_2.1_vae_bf16.safetensors"
+            ],
+            "widgets_values_named": {
+              "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+            }
+          },
+          {
+            "id": 456,
+            "type": "EmptyLatentImage",
+            "pos": [
+              -70,
+              1010
+            ],
+            "size": [
+              300,
+              120
+            ],
+            "flags": {},
+            "order": 4,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "width",
+                "name": "width",
+                "type": "INT",
+                "widget": {
+                  "name": "width"
+                },
+                "link": 660
+              },
+              {
+                "localized_name": "height",
+                "name": "height",
+                "type": "INT",
+                "widget": {
+                  "name": "height"
+                },
+                "link": 661
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "LATENT",
+                "name": "LATENT",
+                "type": "LATENT",
+                "links": [
+                  684
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "EmptyLatentImage"
+            },
+            "widgets_values": [
+              1024,
+              1024,
+              1
+            ],
+            "widgets_values_named": {
+              "width": 1024,
+              "height": 1024,
+              "batch_size": 1
+            }
+          },
+          {
+            "id": 457,
+            "type": "VAEDecode",
+            "pos": [
+              1620,
+              660
+            ],
+            "size": [
+              230,
+              60
+            ],
+            "flags": {},
+            "order": 5,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "samples",
+                "name": "samples",
+                "type": "LATENT",
+                "link": 651
+              },
+              {
+                "localized_name": "vae",
+                "name": "vae",
+                "type": "VAE",
+                "link": 649
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "IMAGE",
+                "name": "IMAGE",
+                "type": "IMAGE",
+                "links": [
+                  650
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "VAEDecode"
+            }
+          },
+          {
+            "id": 458,
+            "type": "KSampler",
+            "pos": [
+              1180,
+              640
+            ],
+            "size": [
+              270,
+              270
+            ],
+            "flags": {},
+            "order": 6,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL",
+                "link": 689
+              },
+              {
+                "localized_name": "positive",
+                "name": "positive",
+                "type": "CONDITIONING",
+                "link": 722
+              },
+              {
+                "localized_name": "negative",
+                "name": "negative",
+                "type": "CONDITIONING",
+                "link": 723
+              },
+              {
+                "localized_name": "latent_image",
+                "name": "latent_image",
+                "type": "LATENT",
+                "link": 682
+              },
+              {
+                "localized_name": "seed",
+                "name": "seed",
+                "type": "INT",
+                "widget": {
+                  "name": "seed"
+                },
+                "link": 667
+              },
+              {
+                "localized_name": "steps",
+                "name": "steps",
+                "type": "INT",
+                "widget": {
+                  "name": "steps"
+                },
+                "link": 659
+              },
+              {
+                "localized_name": "cfg",
+                "name": "cfg",
+                "type": "FLOAT",
+                "widget": {
+                  "name": "cfg"
+                },
+                "link": 658
+              },
+              {
+                "localized_name": "sampler_name",
+                "name": "sampler_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "sampler_name"
+                },
+                "link": 662
+              },
+              {
+                "localized_name": "scheduler",
+                "name": "scheduler",
+                "type": "COMBO",
+                "widget": {
+                  "name": "scheduler"
+                },
+                "link": 668
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "LATENT",
+                "name": "LATENT",
+                "type": "LATENT",
+                "links": [
+                  651
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "KSampler"
+            },
+            "widgets_values": [
+              0,
+              "randomize",
+              25,
+              1,
+              "euler",
+              "simple",
+              1
+            ],
+            "widgets_values_named": {
+              "seed": 0,
+              "control_after_generate": "randomize",
+              "steps": 25,
+              "cfg": 1,
+              "sampler_name": "euler",
+              "scheduler": "simple",
+              "denoise": 1
+            }
+          },
+          {
+            "id": 468,
+            "type": "ComfySwitchNode",
+            "pos": [
+              570,
+              1040
+            ],
+            "size": [
+              270,
+              80
+            ],
+            "flags": {},
+            "order": 7,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "on_false",
+                "name": "on_false",
+                "shape": 7,
+                "type": "LATENT",
+                "link": 724
+              },
+              {
+                "localized_name": "on_true",
+                "name": "on_true",
+                "shape": 7,
+                "type": "LATENT",
+                "link": 684
+              },
+              {
+                "localized_name": "switch",
+                "name": "switch",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "switch"
+                },
+                "link": 703
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "output",
+                "name": "output",
+                "type": "LATENT",
+                "links": [
+                  682
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "ComfySwitchNode"
+            },
+            "widgets_values": [
+              false
+            ],
+            "widgets_values_named": {
+              "switch": false
+            }
+          },
+          {
+            "id": 469,
+            "type": "QwenImage21Cache",
+            "pos": [
+              1180,
+              460
+            ],
+            "size": [
+              270,
+              90
+            ],
+            "flags": {},
+            "order": 8,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "model",
+                "name": "model",
+                "type": "MODEL",
+                "link": 688
+              },
+              {
+                "localized_name": "device",
+                "name": "device",
+                "type": "COMBO",
+                "widget": {
+                  "name": "device"
+                },
+                "link": 729
+              },
+              {
+                "localized_name": "dtype",
+                "name": "dtype",
+                "type": "COMBO",
+                "widget": {
+                  "name": "dtype"
+                },
+                "link": 730
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "MODEL",
+                "name": "MODEL",
+                "type": "MODEL",
+                "links": [
+                  689
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "QwenImage21Cache"
+            },
+            "widgets_values": [
+              "auto",
+              "default"
+            ],
+            "widgets_values_named": {
+              "device": "auto",
+              "dtype": "default"
+            }
+          },
+          {
+            "id": 474,
+            "type": "TextEncodeQwenImage21",
+            "pos": [
+              500,
+              430
+            ],
+            "size": [
+              460,
+              520
+            ],
+            "flags": {},
+            "order": 9,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "clip",
+                "name": "clip",
+                "type": "CLIP",
+                "link": 721
+              },
+              {
+                "localized_name": "image_1",
+                "name": "images.image_1",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 710
+              },
+              {
+                "localized_name": "vae",
+                "name": "vae",
+                "shape": 7,
+                "type": "VAE",
+                "link": 720
+              },
+              {
+                "localized_name": "prompt",
+                "name": "prompt",
+                "type": "STRING",
+                "widget": {
+                  "name": "prompt"
+                },
+                "link": 743
+              },
+              {
+                "localized_name": "negative_prompt",
+                "name": "negative_prompt",
+                "type": "STRING",
+                "widget": {
+                  "name": "negative_prompt"
+                },
+                "link": 727
+              },
+              {
+                "localized_name": "resolution",
+                "name": "resolution",
+                "type": "INT",
+                "widget": {
+                  "name": "resolution"
+                },
+                "link": 725
+              },
+              {
+                "localized_name": "image_12",
+                "name": "images.image_12",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              },
+              {
+                "localized_name": "image_7",
+                "name": "images.image_7",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 716
+              },
+              {
+                "localized_name": "image_8",
+                "name": "images.image_8",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 717
+              },
+              {
+                "localized_name": "image_9",
+                "name": "images.image_9",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 718
+              },
+              {
+                "localized_name": "image_10",
+                "name": "images.image_10",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 719
+              },
+              {
+                "localized_name": "image_11",
+                "name": "images.image_11",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              },
+              {
+                "localized_name": "image_2",
+                "name": "images.image_2",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 711
+              },
+              {
+                "localized_name": "image_3",
+                "name": "images.image_3",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 712
+              },
+              {
+                "localized_name": "image_4",
+                "name": "images.image_4",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 713
+              },
+              {
+                "localized_name": "image_5",
+                "name": "images.image_5",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 714
+              },
+              {
+                "localized_name": "image_6",
+                "name": "images.image_6",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 715
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "positive",
+                "name": "positive",
+                "type": "CONDITIONING",
+                "links": [
+                  722
+                ]
+              },
+              {
+                "localized_name": "negative",
+                "name": "negative",
+                "type": "CONDITIONING",
+                "links": [
+                  723
+                ]
+              },
+              {
+                "localized_name": "latent",
+                "name": "latent",
+                "type": "LATENT",
+                "links": [
+                  724
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TextEncodeQwenImage21"
+            },
+            "widgets_values": [
+              "",
+              "",
+              1024
+            ],
+            "widgets_values_named": {
+              "prompt": "",
+              "negative_prompt": "",
+              "resolution": 1024
+            }
+          },
+          {
+            "id": 477,
+            "type": "CLIPLoader",
+            "pos": [
+              -180,
+              -480
+            ],
+            "size": [
+              530,
+              120
+            ],
+            "flags": {},
+            "order": 10,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "clip_name",
+                "name": "clip_name",
+                "type": "COMBO",
+                "widget": {
+                  "name": "clip_name"
+                },
+                "link": 746
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "CLIP",
+                "name": "CLIP",
+                "type": "CLIP",
+                "links": [
+                  800
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "CLIPLoader",
+              "models": [
+                {
+                  "name": "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+                  "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+                  "directory": "text_encoders"
+                }
+              ]
+            },
+            "widgets_values": [
+              "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+              "qwen_image",
+              "default"
+            ],
+            "widgets_values_named": {
+              "clip_name": "qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot.safetensors",
+              "type": "qwen_image",
+              "device": "default"
+            }
+          },
+          {
+            "id": 479,
+            "type": "PrimitiveStringMultiline",
+            "pos": [
+              -180,
+              10
+            ],
+            "size": [
+              620,
+              240
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [],
+            "outputs": [
+              {
+                "localized_name": "STRING",
+                "name": "STRING",
+                "type": "STRING",
+                "links": [
+                  901
+                ]
+              }
+            ],
+            "title": "Text (System Prompt)",
+            "properties": {
+              "Node name for S&R": "PrimitiveStringMultiline"
+            },
+            "widgets_values": [
+              "# Edit Prompt Enhancer — General (v2, 精简版)\n\n**FIRST — there are TWO separate language decisions. Do NOT conflate them.**\n\n**(A) Language of the rewritten prompt's DESCRIPTIVE prose — every word OUTSIDE double quotes (the description you write for the diffusion model, NOT the text painted into the image). This decision is final and non-negotiable:**\n- User instruction is in Chinese → write the description in Chinese.\n- User instruction is in English → write the description in English.\n- User instruction is in ANY other language (Japanese, Korean, French, Spanish, Thai, etc.) → write the description in English.\n\n**(B) Language of the TEXT THAT WILL BE RENDERED INTO THE OUTPUT IMAGE — the content INSIDE double quotes. Decide it in this strict priority order:**\n1. If the user's instruction gives the exact text to write, OR names a target language for the text (e.g. \"改成'夏日特惠'\", \"把标题写成英文\", \"add a Japanese title\", \"write the caption in Thai\") → render exactly that text / in exactly that specified language.\n2. Otherwise, if the input image already contains text → render in the DOMINANT language of the image's existing text — even when the instruction is written in a different language.\n3. Otherwise (the image contains no text AND the instruction names no target language) → render in the language of the user's instruction itself — including Japanese, Korean, Thai, Arabic, French, etc. Do NOT force it to English.\nWorked example: image is mostly Thai, instruction is in English asking to add/redesign a title without giving the exact words or a language → the rendered (quoted) text must be **Thai** (the image's dominant language), while the surrounding description (A) is still written in English.\n\nTwo reinforcements on decision (B): all rendered (quoted) text must be **monolingual** — do not mix Chinese and English inside the quotes and do not emit a bilingual pair unless the user explicitly asks for one. And **genre never overrides input language**: a \"spec sheet / cinematic data-document / storyboard / technical parameter\" look is achieved through layout and typography, NOT by switching rendered labels to English — every header, label, and caption stays in the decided language (standardized units and user-given proper nouns may remain Latin).\n\nYou are an expert at clarifying image editing instructions. Given a user's vague or ambiguous edit instruction and the input image(s), rewrite it into a precise, unambiguous, actionable editing directive. An input image is ALWAYS present — this is always an image-editing task, never text-to-image from nothing.\n\n## Core Objective\n\nRewrite the instruction so a downstream image-editing model can execute it without guessing — anchored on what the input image(s) actually show, faithful to the user's intent, inventing nothing.\n\n**How much you build is intent-branched.** When the user wants *this picture changed* (a local object/attribute/background edit, a text or UI edit, a quality or style change, a viewpoint/canvas transform), clarify and constrain: say exactly what changes, and let everything else stand. When the user wants *a new picture of this subject* (placing a subject in a new scene, compositing across images, a photo-shoot or poster or infographic built from a reference), construct actively: design the scene, lighting, composition and layout to a professional standard. Scale the elaboration to what was asked — a plain placement stays restrained, a styled shoot or a publication-grade poster is built out fully.\n\n## The Governing Principle — Attribute Disentanglement at Full Strength\n\n**Edit exactly the attribute(s) the user named, push each to a strong and unmistakable degree, and hold everything else at input fidelity.**\n\nBoth halves matter, and the two failure modes are symmetric:\n\n- **Leakage** — touching what the user did not name (a sharpen that re-grades color, an upscale that reframes, a style change that drifts a face, an outfit swap that drops an accessory, a background change that \"helpfully\" cleans up something unmentioned).\n- **Under-editing** — an output a viewer could mistake for the unedited input, because the requested change was applied faintly.\n\nPreservation locks **content, never edit strength**. Recognizability is bought by naming what stays fixed, not by holding the effect back.\n\n## What to Anchor, What to Decide\n\n**Anchor on the image.** Every spatial, tonal and contextual claim comes from what is visibly there. If you are unsure a detail exists, leave it out — a preserved element described at a higher level of abstraction is always safer than an invented specific.\n\n**Say what stays, without repainting it.** Name the untargeted content by type, position and role rather than describing its appearance, and prefer one blanket preservation clause over walking the frame. A preservation description reads to the model as a generation instruction: the more concretely you describe something you meant to keep, the more likely it drifts. Describe appearance concretely only for what you are actually changing, or when it is the only way to disambiguate between similar objects.\n\n**Identity is the hardest invariant.** A person's facial identity and the personal accessories that make them recognizable; a product's exact design, markings and count; and the input's rendering medium (photograph, anime, illustration, sketch, 3D render, painting) all survive every edit unless the user explicitly targets them. When identity comes from a reference image, point at that image rather than describing features in words — verbal descriptions make the model regenerate and degrade the likeness.\n\n**Resolve ambiguity, then commit.** Turn vague intent, imprecise spatial reference and unparameterized style words into something concrete and observable. Translate abstract quality language into the visual properties it implies. Where the instruction offers alternatives or contradicts itself, pick the most reasonable reading and state it as a decision. Keep the user's own action verb, spatial relations and described state intact, and treat anything they asked to preserve as absolute. Preserve creative or physically impossible intent rather than correcting it.\n\n**Only what was asked.** Do not add operations the user did not request, and do not clean up unmentioned defects, overlays or clutter however prominent they look. When an edit removes, moves or reveals something, say enough about the newly exposed region that the result stays physically coherent.\n\n**Text in the image is literal.** Whenever readable text will appear in the output, commit to the exact characters — every element, quoted, nothing summarized or abbreviated away. Text you cannot commit to should not be added at all. Match the typography and language the input establishes unless the user asks otherwise. When the operation extends the canvas outward, name it as outpainting explicitly.\n\n**Write it as an instruction.** Lead with the operation, not a description of the finished picture, and write from the perspective of someone holding only the input image(s).\n\n## Thinking Process\n\nBefore emitting the final prompt, reason through: what the image(s) actually contain (including a complete reading of any text present); what the user is asking for and which attributes that names; what must therefore stay fixed; and finally the composed directive. Close with a check that every visible element is either the target of the edit or covered by what stays fixed, that the requested change is unmistakable, that nothing outside the target was touched, and that every quoted string obeys language decision (B).\n\n## Image Reference Rules\n\nFor Multi-Image Input (N >= 2), the rewritten instruction MUST use `<image1>`, `<image2>`, ... to refer to each input image. Do not use natural language references like \"图1\", \"第一张图\", \"the first image\", or \"image A\". This tagging format is mandatory and non-negotiable. For single-image input (N = 1), do NOT use tags — refer to the image naturally (\"图像\", \"图片中\", \"the image\").\n\nState each image's role explicitly — which one is the canvas whose composition and untargeted content survive, and which supply material to transfer — and say what is taken from each. For scene generation with no canvas (合影/合照 and the like), all images serve as identity sources. Describe every referenced image individually; never compress several into a range or a group to avoid describing them one by one.\n\n## Output Format\nOutput ONLY the rewritten editing instruction itself: one single continuous paragraph of plain text.\n\nFormatting rules:\n- The entire rewritten prompt must be a single continuous paragraph with NO line breaks or newline characters.\n- The response must contain nothing except the instruction itself: no object or array wrapper, no field names or key-value pairs, no headings, labels, or prefaces, no greetings, explanations, or commentary, no markdown, and no code fences. Begin with the first word of the instruction and end with its last word.\n- Do not wrap the whole instruction in quotes: double quotes are reserved for text that will be RENDERED in the image (next rule).\n- All text that should appear as visible, readable content in the output image must be enclosed in double quotes (\"\"). Descriptive or structural language that does not appear as rendered text should NOT be quoted.\n- **Never include any resolution or aspect ratio information** (e.g., \"2:3\", \"16:9\", \"1920x1080\", \"2K\", \"4K\"). Output size is decided downstream, not by you.\n- Write it out in full — no ellipsis, no truncation.\n- State requirements affirmatively (\"保持背景与输入图完全一致\") rather than as prohibitions (\"禁止改变背景\"). Standard preservation phrasing \"保持/保留[X]不变\" is fine.\n- Be precise and decisive: no hedging, no unresolved alternatives, no vague degree words left unresolved.\n- The descriptive prose (outside double quotes) follows language decision (A); the text rendered inside the image (inside double quotes) follows language decision (B). Retain proper nouns and domain-specific terms in their original language, placed in English double quotes.\n- **Language-purge self-check (do this last)**: re-scan every double-quoted string — the text that will be RENDERED in the image — and enforce language decision (B). No quoted string may mix Chinese and English, form a bilingual pair, or carry a parenthetical translation gloss unless the user explicitly asked. Standardized units and user-given proper nouns may remain Latin.\n\nThe user's edit instruction to rewrite is:"
+            ],
+            "widgets_values_named": {
+              "value": "# Edit Prompt Enhancer — General (v2, 精简版)\n\n**FIRST — there are TWO separate language decisions. Do NOT conflate them.**\n\n**(A) Language of the rewritten prompt's DESCRIPTIVE prose — every word OUTSIDE double quotes (the description you write for the diffusion model, NOT the text painted into the image). This decision is final and non-negotiable:**\n- User instruction is in Chinese → write the description in Chinese.\n- User instruction is in English → write the description in English.\n- User instruction is in ANY other language (Japanese, Korean, French, Spanish, Thai, etc.) → write the description in English.\n\n**(B) Language of the TEXT THAT WILL BE RENDERED INTO THE OUTPUT IMAGE — the content INSIDE double quotes. Decide it in this strict priority order:**\n1. If the user's instruction gives the exact text to write, OR names a target language for the text (e.g. \"改成'夏日特惠'\", \"把标题写成英文\", \"add a Japanese title\", \"write the caption in Thai\") → render exactly that text / in exactly that specified language.\n2. Otherwise, if the input image already contains text → render in the DOMINANT language of the image's existing text — even when the instruction is written in a different language.\n3. Otherwise (the image contains no text AND the instruction names no target language) → render in the language of the user's instruction itself — including Japanese, Korean, Thai, Arabic, French, etc. Do NOT force it to English.\nWorked example: image is mostly Thai, instruction is in English asking to add/redesign a title without giving the exact words or a language → the rendered (quoted) text must be **Thai** (the image's dominant language), while the surrounding description (A) is still written in English.\n\nTwo reinforcements on decision (B): all rendered (quoted) text must be **monolingual** — do not mix Chinese and English inside the quotes and do not emit a bilingual pair unless the user explicitly asks for one. And **genre never overrides input language**: a \"spec sheet / cinematic data-document / storyboard / technical parameter\" look is achieved through layout and typography, NOT by switching rendered labels to English — every header, label, and caption stays in the decided language (standardized units and user-given proper nouns may remain Latin).\n\nYou are an expert at clarifying image editing instructions. Given a user's vague or ambiguous edit instruction and the input image(s), rewrite it into a precise, unambiguous, actionable editing directive. An input image is ALWAYS present — this is always an image-editing task, never text-to-image from nothing.\n\n## Core Objective\n\nRewrite the instruction so a downstream image-editing model can execute it without guessing — anchored on what the input image(s) actually show, faithful to the user's intent, inventing nothing.\n\n**How much you build is intent-branched.** When the user wants *this picture changed* (a local object/attribute/background edit, a text or UI edit, a quality or style change, a viewpoint/canvas transform), clarify and constrain: say exactly what changes, and let everything else stand. When the user wants *a new picture of this subject* (placing a subject in a new scene, compositing across images, a photo-shoot or poster or infographic built from a reference), construct actively: design the scene, lighting, composition and layout to a professional standard. Scale the elaboration to what was asked — a plain placement stays restrained, a styled shoot or a publication-grade poster is built out fully.\n\n## The Governing Principle — Attribute Disentanglement at Full Strength\n\n**Edit exactly the attribute(s) the user named, push each to a strong and unmistakable degree, and hold everything else at input fidelity.**\n\nBoth halves matter, and the two failure modes are symmetric:\n\n- **Leakage** — touching what the user did not name (a sharpen that re-grades color, an upscale that reframes, a style change that drifts a face, an outfit swap that drops an accessory, a background change that \"helpfully\" cleans up something unmentioned).\n- **Under-editing** — an output a viewer could mistake for the unedited input, because the requested change was applied faintly.\n\nPreservation locks **content, never edit strength**. Recognizability is bought by naming what stays fixed, not by holding the effect back.\n\n## What to Anchor, What to Decide\n\n**Anchor on the image.** Every spatial, tonal and contextual claim comes from what is visibly there. If you are unsure a detail exists, leave it out — a preserved element described at a higher level of abstraction is always safer than an invented specific.\n\n**Say what stays, without repainting it.** Name the untargeted content by type, position and role rather than describing its appearance, and prefer one blanket preservation clause over walking the frame. A preservation description reads to the model as a generation instruction: the more concretely you describe something you meant to keep, the more likely it drifts. Describe appearance concretely only for what you are actually changing, or when it is the only way to disambiguate between similar objects.\n\n**Identity is the hardest invariant.** A person's facial identity and the personal accessories that make them recognizable; a product's exact design, markings and count; and the input's rendering medium (photograph, anime, illustration, sketch, 3D render, painting) all survive every edit unless the user explicitly targets them. When identity comes from a reference image, point at that image rather than describing features in words — verbal descriptions make the model regenerate and degrade the likeness.\n\n**Resolve ambiguity, then commit.** Turn vague intent, imprecise spatial reference and unparameterized style words into something concrete and observable. Translate abstract quality language into the visual properties it implies. Where the instruction offers alternatives or contradicts itself, pick the most reasonable reading and state it as a decision. Keep the user's own action verb, spatial relations and described state intact, and treat anything they asked to preserve as absolute. Preserve creative or physically impossible intent rather than correcting it.\n\n**Only what was asked.** Do not add operations the user did not request, and do not clean up unmentioned defects, overlays or clutter however prominent they look. When an edit removes, moves or reveals something, say enough about the newly exposed region that the result stays physically coherent.\n\n**Text in the image is literal.** Whenever readable text will appear in the output, commit to the exact characters — every element, quoted, nothing summarized or abbreviated away. Text you cannot commit to should not be added at all. Match the typography and language the input establishes unless the user asks otherwise. When the operation extends the canvas outward, name it as outpainting explicitly.\n\n**Write it as an instruction.** Lead with the operation, not a description of the finished picture, and write from the perspective of someone holding only the input image(s).\n\n## Thinking Process\n\nBefore emitting the final prompt, reason through: what the image(s) actually contain (including a complete reading of any text present); what the user is asking for and which attributes that names; what must therefore stay fixed; and finally the composed directive. Close with a check that every visible element is either the target of the edit or covered by what stays fixed, that the requested change is unmistakable, that nothing outside the target was touched, and that every quoted string obeys language decision (B).\n\n## Image Reference Rules\n\nFor Multi-Image Input (N >= 2), the rewritten instruction MUST use `<image1>`, `<image2>`, ... to refer to each input image. Do not use natural language references like \"图1\", \"第一张图\", \"the first image\", or \"image A\". This tagging format is mandatory and non-negotiable. For single-image input (N = 1), do NOT use tags — refer to the image naturally (\"图像\", \"图片中\", \"the image\").\n\nState each image's role explicitly — which one is the canvas whose composition and untargeted content survive, and which supply material to transfer — and say what is taken from each. For scene generation with no canvas (合影/合照 and the like), all images serve as identity sources. Describe every referenced image individually; never compress several into a range or a group to avoid describing them one by one.\n\n## Output Format\nOutput ONLY the rewritten editing instruction itself: one single continuous paragraph of plain text.\n\nFormatting rules:\n- The entire rewritten prompt must be a single continuous paragraph with NO line breaks or newline characters.\n- The response must contain nothing except the instruction itself: no object or array wrapper, no field names or key-value pairs, no headings, labels, or prefaces, no greetings, explanations, or commentary, no markdown, and no code fences. Begin with the first word of the instruction and end with its last word.\n- Do not wrap the whole instruction in quotes: double quotes are reserved for text that will be RENDERED in the image (next rule).\n- All text that should appear as visible, readable content in the output image must be enclosed in double quotes (\"\"). Descriptive or structural language that does not appear as rendered text should NOT be quoted.\n- **Never include any resolution or aspect ratio information** (e.g., \"2:3\", \"16:9\", \"1920x1080\", \"2K\", \"4K\"). Output size is decided downstream, not by you.\n- Write it out in full — no ellipsis, no truncation.\n- State requirements affirmatively (\"保持背景与输入图完全一致\") rather than as prohibitions (\"禁止改变背景\"). Standard preservation phrasing \"保持/保留[X]不变\" is fine.\n- Be precise and decisive: no hedging, no unresolved alternatives, no vague degree words left unresolved.\n- The descriptive prose (outside double quotes) follows language decision (A); the text rendered inside the image (inside double quotes) follows language decision (B). Retain proper nouns and domain-specific terms in their original language, placed in English double quotes.\n- **Language-purge self-check (do this last)**: re-scan every double-quoted string — the text that will be RENDERED in the image — and enforce language decision (B). No quoted string may mix Chinese and English, form a bilingual pair, or carry a parenthetical translation gloss unless the user explicitly asked. Standardized units and user-given proper nouns may remain Latin.\n\nThe user's edit instruction to rewrite is:"
+            }
+          },
+          {
+            "id": 480,
+            "type": "PreviewAny",
+            "pos": [
+              1040,
+              -480
+            ],
+            "size": [
+              470,
+              680
+            ],
+            "flags": {},
+            "order": 11,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "source",
+                "name": "source",
+                "type": "*",
+                "link": 791
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "STRING",
+                "name": "STRING",
+                "type": "STRING",
+                "links": [
+                  743
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "PreviewAny"
+            },
+            "widgets_values": [],
+            "widgets_values_named": {}
+          },
+          {
+            "id": 484,
+            "type": "ComfySwitchNode",
+            "pos": [
+              620,
+              120
+            ],
+            "size": [
+              270,
+              80
+            ],
+            "flags": {},
+            "order": 12,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "on_false",
+                "name": "on_false",
+                "shape": 7,
+                "type": "STRING",
+                "link": 739
+              },
+              {
+                "localized_name": "on_true",
+                "name": "on_true",
+                "shape": 7,
+                "type": "STRING",
+                "link": 806
+              },
+              {
+                "localized_name": "switch",
+                "name": "switch",
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "switch"
+                },
+                "link": 741
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "output",
+                "name": "output",
+                "type": "STRING",
+                "links": [
+                  791
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "ComfySwitchNode"
+            },
+            "widgets_values": [
+              false
+            ],
+            "widgets_values_named": {
+              "switch": false
+            }
+          },
+          {
+            "id": 485,
+            "type": "BatchImagesNode",
+            "pos": [
+              -180,
+              -310
+            ],
+            "size": [
+              230,
+              270
+            ],
+            "flags": {},
+            "order": 13,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "image0",
+                "name": "images.image0",
+                "type": "IMAGE",
+                "link": 750
+              },
+              {
+                "localized_name": "image1",
+                "name": "images.image1",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 779
+              },
+              {
+                "localized_name": "image5",
+                "name": "images.image5",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 780
+              },
+              {
+                "localized_name": "image6",
+                "name": "images.image6",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 781
+              },
+              {
+                "localized_name": "image7",
+                "name": "images.image7",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 782
+              },
+              {
+                "localized_name": "image8",
+                "name": "images.image8",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 783
+              },
+              {
+                "localized_name": "image9",
+                "name": "images.image9",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 784
+              },
+              {
+                "localized_name": "image10",
+                "name": "images.image10",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 785
+              },
+              {
+                "localized_name": "image11",
+                "name": "images.image11",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 786
+              },
+              {
+                "localized_name": "image12",
+                "name": "images.image12",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 787
+              },
+              {
+                "localized_name": "image13",
+                "name": "images.image13",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              },
+              {
+                "localized_name": "image2",
+                "name": "images.image2",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "IMAGE",
+                "name": "IMAGE",
+                "type": "IMAGE",
+                "links": [
+                  801
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "BatchImagesNode"
+            }
+          },
+          {
+            "id": 500,
+            "type": "TextGenerate",
+            "pos": [
+              500,
+              -480
+            ],
+            "size": [
+              400,
+              460
+            ],
+            "flags": {},
+            "order": 14,
+            "mode": 0,
+            "showAdvanced": true,
+            "inputs": [
+              {
+                "localized_name": "clip",
+                "name": "clip",
+                "type": "CLIP",
+                "link": 800
+              },
+              {
+                "localized_name": "image",
+                "name": "image",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 801
+              },
+              {
+                "localized_name": "video",
+                "name": "video",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              },
+              {
+                "localized_name": "audio",
+                "name": "audio",
+                "shape": 7,
+                "type": "AUDIO",
+                "link": null
+              },
+              {
+                "localized_name": "system_prompt",
+                "name": "system_prompt",
+                "shape": 7,
+                "type": "STRING",
+                "link": 901
+              },
+              {
+                "localized_name": "prompt",
+                "name": "prompt",
+                "type": "STRING",
+                "widget": {
+                  "name": "prompt"
+                },
+                "link": 802
+              },
+              {
+                "localized_name": "max_length",
+                "name": "max_length",
+                "type": "INT",
+                "widget": {
+                  "name": "max_length"
+                },
+                "link": 903
+              },
+              {
+                "localized_name": "seed",
+                "name": "sampling_mode.seed",
+                "type": "INT",
+                "widget": {
+                  "name": "sampling_mode.seed"
+                },
+                "link": 804
+              },
+              {
+                "localized_name": "thinking",
+                "name": "thinking",
+                "shape": 7,
+                "type": "BOOLEAN",
+                "widget": {
+                  "name": "thinking"
+                },
+                "link": 902
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "generated_text",
+                "name": "generated_text",
+                "type": "STRING",
+                "links": [
+                  806
+                ]
+              },
+              {
+                "localized_name": "thinking",
+                "name": "thinking",
+                "type": "STRING",
+                "links": null
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TextGenerate"
+            },
+            "widgets_values": [
+              "",
+              4096,
+              "on",
+              1,
+              20,
+              0.95,
+              0,
+              1,
+              0,
+              0,
+              true,
+              true,
+              "auto"
+            ],
+            "widgets_values_named": {
+              "prompt": "",
+              "max_length": 4096,
+              "sampling_mode": "on",
+              "sampling_mode.temperature": 1,
+              "sampling_mode.top_k": 20,
+              "sampling_mode.top_p": 0.95,
+              "sampling_mode.min_p": 0,
+              "sampling_mode.repetition_penalty": 1,
+              "sampling_mode.seed": 0,
+              "sampling_mode.presence_penalty": 0,
+              "thinking": true,
+              "use_default_template": true,
+              "mtp": "auto"
+            }
+          }
+        ],
+        "groups": [
+          {
+            "id": 34,
+            "title": "Models",
+            "bounding": [
+              -200,
+              300,
+              530,
+              590
+            ],
+            "color": "#3f789e",
+            "flags": {}
+          },
+          {
+            "id": 35,
+            "title": "Image Size",
+            "bounding": [
+              -200,
+              920,
+              530,
+              250
+            ],
+            "color": "#3f789e",
+            "flags": {}
+          },
+          {
+            "id": 36,
+            "title": "Conditioning",
+            "bounding": [
+              360,
+              300,
+              700,
+              860
+            ],
+            "color": "#3f789e",
+            "flags": {}
+          },
+          {
+            "id": 37,
+            "title": "Sampling",
+            "bounding": [
+              1090,
+              300,
+              470,
+              860
+            ],
+            "color": "#3f789e",
+            "flags": {}
+          },
+          {
+            "id": 38,
+            "title": "Prompt Enhancer",
+            "bounding": [
+              -200,
+              -560,
+              1750,
+              830
+            ],
+            "color": "#3f789e",
+            "flags": {}
+          }
+        ],
+        "links": [
+          {
+            "id": 649,
+            "origin_id": 454,
+            "origin_slot": 0,
+            "target_id": 457,
+            "target_slot": 1,
+            "type": "VAE"
+          },
+          {
+            "id": 650,
+            "origin_id": 457,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 651,
+            "origin_id": 458,
+            "origin_slot": 0,
+            "target_id": 457,
+            "target_slot": 0,
+            "type": "LATENT"
+          },
+          {
+            "id": 682,
+            "origin_id": 468,
+            "origin_slot": 0,
+            "target_id": 458,
+            "target_slot": 3,
+            "type": "LATENT"
+          },
+          {
+            "id": 684,
+            "origin_id": 456,
+            "origin_slot": 0,
+            "target_id": 468,
+            "target_slot": 1,
+            "type": "LATENT"
+          },
+          {
+            "id": 688,
+            "origin_id": 451,
+            "origin_slot": 0,
+            "target_id": 469,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 689,
+            "origin_id": 469,
+            "origin_slot": 0,
+            "target_id": 458,
+            "target_slot": 0,
+            "type": "MODEL"
+          },
+          {
+            "id": 722,
+            "origin_id": 474,
+            "origin_slot": 0,
+            "target_id": 458,
+            "target_slot": 1,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 723,
+            "origin_id": 474,
+            "origin_slot": 1,
+            "target_id": 458,
+            "target_slot": 2,
+            "type": "CONDITIONING"
+          },
+          {
+            "id": 724,
+            "origin_id": 474,
+            "origin_slot": 2,
+            "target_id": 468,
+            "target_slot": 0,
+            "type": "LATENT"
+          },
+          {
+            "id": 791,
+            "origin_id": 484,
+            "origin_slot": 0,
+            "target_id": 480,
+            "target_slot": 0,
+            "type": "STRING"
+          },
+          {
+            "id": 806,
+            "origin_id": 500,
+            "origin_slot": 0,
+            "target_id": 484,
+            "target_slot": 1,
+            "type": "STRING"
+          },
+          {
+            "id": 739,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 484,
+            "target_slot": 0,
+            "type": "STRING"
+          },
+          {
+            "id": 741,
+            "origin_id": -10,
+            "origin_slot": 2,
+            "target_id": 484,
+            "target_slot": 2,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 658,
+            "origin_id": -10,
+            "origin_slot": 6,
+            "target_id": 458,
+            "target_slot": 6,
+            "type": "FLOAT"
+          },
+          {
+            "id": 659,
+            "origin_id": -10,
+            "origin_slot": 7,
+            "target_id": 458,
+            "target_slot": 5,
+            "type": "INT"
+          },
+          {
+            "id": 703,
+            "origin_id": -10,
+            "origin_slot": 8,
+            "target_id": 468,
+            "target_slot": 2,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 660,
+            "origin_id": -10,
+            "origin_slot": 9,
+            "target_id": 456,
+            "target_slot": 0,
+            "type": "INT"
+          },
+          {
+            "id": 661,
+            "origin_id": -10,
+            "origin_slot": 10,
+            "target_id": 456,
+            "target_slot": 1,
+            "type": "INT"
+          },
+          {
+            "id": 662,
+            "origin_id": -10,
+            "origin_slot": 11,
+            "target_id": 458,
+            "target_slot": 7,
+            "type": "COMBO"
+          },
+          {
+            "id": 668,
+            "origin_id": -10,
+            "origin_slot": 12,
+            "target_id": 458,
+            "target_slot": 8,
+            "type": "COMBO"
+          },
+          {
+            "id": 667,
+            "origin_id": -10,
+            "origin_slot": 13,
+            "target_id": 458,
+            "target_slot": 4,
+            "type": "INT"
+          },
+          {
+            "id": 663,
+            "origin_id": -10,
+            "origin_slot": 14,
+            "target_id": 451,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 664,
+            "origin_id": -10,
+            "origin_slot": 15,
+            "target_id": 453,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 665,
+            "origin_id": -10,
+            "origin_slot": 16,
+            "target_id": 454,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 729,
+            "origin_id": -10,
+            "origin_slot": 17,
+            "target_id": 469,
+            "target_slot": 1,
+            "type": "COMBO"
+          },
+          {
+            "id": 730,
+            "origin_id": -10,
+            "origin_slot": 18,
+            "target_id": 469,
+            "target_slot": 2,
+            "type": "COMBO"
+          },
+          {
+            "id": 746,
+            "origin_id": -10,
+            "origin_slot": 19,
+            "target_id": 477,
+            "target_slot": 0,
+            "type": "COMBO"
+          },
+          {
+            "id": 721,
+            "origin_id": 453,
+            "origin_slot": 0,
+            "target_id": 474,
+            "target_slot": 0,
+            "type": "CLIP"
+          },
+          {
+            "id": 710,
+            "origin_id": -10,
+            "origin_slot": 20,
+            "target_id": 474,
+            "target_slot": 1,
+            "type": "IMAGE"
+          },
+          {
+            "id": 720,
+            "origin_id": 454,
+            "origin_slot": 0,
+            "target_id": 474,
+            "target_slot": 2,
+            "type": "VAE"
+          },
+          {
+            "id": 743,
+            "origin_id": 480,
+            "origin_slot": 0,
+            "target_id": 474,
+            "target_slot": 3,
+            "type": "STRING"
+          },
+          {
+            "id": 727,
+            "origin_id": -10,
+            "origin_slot": 5,
+            "target_id": 474,
+            "target_slot": 4,
+            "type": "STRING"
+          },
+          {
+            "id": 725,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": 474,
+            "target_slot": 5,
+            "type": "INT"
+          },
+          {
+            "id": 716,
+            "origin_id": -10,
+            "origin_slot": 26,
+            "target_id": 474,
+            "target_slot": 7,
+            "type": "IMAGE"
+          },
+          {
+            "id": 717,
+            "origin_id": -10,
+            "origin_slot": 27,
+            "target_id": 474,
+            "target_slot": 8,
+            "type": "IMAGE"
+          },
+          {
+            "id": 718,
+            "origin_id": -10,
+            "origin_slot": 28,
+            "target_id": 474,
+            "target_slot": 9,
+            "type": "IMAGE"
+          },
+          {
+            "id": 719,
+            "origin_id": -10,
+            "origin_slot": 29,
+            "target_id": 474,
+            "target_slot": 10,
+            "type": "IMAGE"
+          },
+          {
+            "id": 711,
+            "origin_id": -10,
+            "origin_slot": 21,
+            "target_id": 474,
+            "target_slot": 12,
+            "type": "IMAGE"
+          },
+          {
+            "id": 712,
+            "origin_id": -10,
+            "origin_slot": 22,
+            "target_id": 474,
+            "target_slot": 13,
+            "type": "IMAGE"
+          },
+          {
+            "id": 713,
+            "origin_id": -10,
+            "origin_slot": 23,
+            "target_id": 474,
+            "target_slot": 14,
+            "type": "IMAGE"
+          },
+          {
+            "id": 714,
+            "origin_id": -10,
+            "origin_slot": 24,
+            "target_id": 474,
+            "target_slot": 15,
+            "type": "IMAGE"
+          },
+          {
+            "id": 715,
+            "origin_id": -10,
+            "origin_slot": 25,
+            "target_id": 474,
+            "target_slot": 16,
+            "type": "IMAGE"
+          },
+          {
+            "id": 750,
+            "origin_id": -10,
+            "origin_slot": 20,
+            "target_id": 485,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 779,
+            "origin_id": -10,
+            "origin_slot": 21,
+            "target_id": 485,
+            "target_slot": 1,
+            "type": "IMAGE"
+          },
+          {
+            "id": 780,
+            "origin_id": -10,
+            "origin_slot": 22,
+            "target_id": 485,
+            "target_slot": 2,
+            "type": "IMAGE"
+          },
+          {
+            "id": 781,
+            "origin_id": -10,
+            "origin_slot": 23,
+            "target_id": 485,
+            "target_slot": 3,
+            "type": "IMAGE"
+          },
+          {
+            "id": 782,
+            "origin_id": -10,
+            "origin_slot": 24,
+            "target_id": 485,
+            "target_slot": 4,
+            "type": "IMAGE"
+          },
+          {
+            "id": 783,
+            "origin_id": -10,
+            "origin_slot": 25,
+            "target_id": 485,
+            "target_slot": 5,
+            "type": "IMAGE"
+          },
+          {
+            "id": 784,
+            "origin_id": -10,
+            "origin_slot": 26,
+            "target_id": 485,
+            "target_slot": 6,
+            "type": "IMAGE"
+          },
+          {
+            "id": 785,
+            "origin_id": -10,
+            "origin_slot": 27,
+            "target_id": 485,
+            "target_slot": 7,
+            "type": "IMAGE"
+          },
+          {
+            "id": 786,
+            "origin_id": -10,
+            "origin_slot": 28,
+            "target_id": 485,
+            "target_slot": 8,
+            "type": "IMAGE"
+          },
+          {
+            "id": 787,
+            "origin_id": -10,
+            "origin_slot": 29,
+            "target_id": 485,
+            "target_slot": 9,
+            "type": "IMAGE"
+          },
+          {
+            "id": 800,
+            "origin_id": 477,
+            "origin_slot": 0,
+            "target_id": 500,
+            "target_slot": 0,
+            "type": "CLIP"
+          },
+          {
+            "id": 801,
+            "origin_id": 485,
+            "origin_slot": 0,
+            "target_id": 500,
+            "target_slot": 1,
+            "type": "IMAGE"
+          },
+          {
+            "id": 901,
+            "origin_id": 479,
+            "origin_slot": 0,
+            "target_id": 500,
+            "target_slot": 4,
+            "type": "STRING"
+          },
+          {
+            "id": 802,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 500,
+            "target_slot": 5,
+            "type": "STRING"
+          },
+          {
+            "id": 903,
+            "origin_id": -10,
+            "origin_slot": 4,
+            "target_id": 500,
+            "target_slot": 6,
+            "type": "INT"
+          },
+          {
+            "id": 902,
+            "origin_id": -10,
+            "origin_slot": 3,
+            "target_id": 500,
+            "target_slot": 8,
+            "type": "BOOLEAN"
+          },
+          {
+            "id": 804,
+            "origin_id": -10,
+            "origin_slot": 13,
+            "target_id": 500,
+            "target_slot": 7,
+            "type": "INT"
+          }
+        ],
+        "extra": {}
+      }
+    ]
+  },
+  "config": {},
+  "extra": {
+    "frontendVersion": "1.53.6",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "ds": {
+      "scale": 0.6940244165782402,
+      "offset": [
+        973.3086639020673,
+        -1999.8825382096318
+      ]
+    }
+  },
+  "version": 0.4
+}
