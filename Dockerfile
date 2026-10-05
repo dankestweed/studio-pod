@@ -1,4 +1,4 @@
-# Studio pod image: SwarmUI + ComfyUI (torch cu128) + dotnet, pre-configured.
+# Studio pod image: plain ComfyUI (torch cu128), no SwarmUI.
 # Built by GitHub Actions, served from GHCR, runs on any RunPod GPU (4090..B200).
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -10,32 +10,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # rclone + tailscale baked in (no boot-time installs)
 RUN curl -fsSL https://rclone.org/install.sh | bash && \
     curl -fsSL https://tailscale.com/install.sh | sh
-# SwarmUI, built ahead of time
-WORKDIR /SwarmUI
-RUN git clone --depth 1 https://github.com/mcmonkeyprojects/SwarmUI.git . && \
-    bash launchtools/linux-dotnet-install.sh /SwarmUI/.dotnet && \
-    export PATH="/SwarmUI/.dotnet:$PATH" && \
-    bash launchtools/linux-build-logic.sh && \
-    test -e src/bin/live_release
-# ComfyUI via SwarmUI's own installer, pin torch to cu128 (Blackwell-ready),
-# and pre-install the packages Swarm would otherwise fetch on first launch
-# (mediapipe: comfyui_facetools imports it but declares NO deps anywhere - found the hard way;
-#  frontend-package floor: silences the version-skew alert vs the ComfyUI backend)
-RUN export PATH="/SwarmUI/.dotnet:$PATH" && \
-    bash launchtools/comfy-install-linux.sh nv && \
-    COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
-    "$COMFY_DIR/venv/bin/pip" install --no-cache-dir --force-reinstall \
+# ComfyUI at a PINNED release. To upgrade: change COMFY_REF and push -> this layer and
+# everything below rebuilds (the old setup froze ComfyUI at the first build via the cache).
+# torch pinned to cu128 (Blackwell-ready); extra packages packs import without declaring
+# (mediapipe: comfyui_facetools imports it but declares NO deps anywhere - found the hard way)
+ARG COMFY_REF=v0.38.2
+RUN git clone --depth 1 --branch "${COMFY_REF}" https://github.com/comfyanonymous/ComfyUI.git /comfy && \
+    python3 -m venv /comfy/venv && \
+    /comfy/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /comfy/venv/bin/pip install --no-cache-dir \
         torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
-    "$COMFY_DIR/venv/bin/pip" install --no-cache-dir \
+    /comfy/venv/bin/pip install --no-cache-dir -r /comfy/requirements.txt && \
+    /comfy/venv/bin/pip install --no-cache-dir \
         rembg onnxruntime matplotlib opencv-python-headless imageio-ffmpeg dill omegaconf diffusers ultralytics \
-        mediapipe "comfyui-frontend-package>=1.51.10" && \
-    { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
-    rm -rf "$COMFY_DIR/.git" /root/.cache/pip
+        mediapipe && \
+    { /comfy/venv/bin/pip cache purge || true; } && \
+    rm -rf /comfy/.git /root/.cache/pip && \
+    mv /comfy/models /comfy/models.dist
 # Custom ComfyUI nodes from nodes.txt, cloned at pinned commits and their pip
 # requirements installed at build time (zero boot-time cost; build fails loudly
 # if a node or its deps are broken)
 COPY nodes.txt /studio/nodes.txt
-RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
+RUN COMFY_DIR=/comfy && \
     cd "$COMFY_DIR/custom_nodes" && \
     while IFS= read -r spec || [ -n "$spec" ]; do \
       case "$spec" in ""|"#"*) continue;; esac; \
@@ -53,11 +49,10 @@ RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI
     rm -rf /root/.cache/pip
 # QwenVL FP8 on CUDA<13 needs these exact pins (workflow author's verified set) -
 # installed LAST so no pack requirement can re-upgrade them; xformers out per same guide.
-RUN COMFY_DIR=$(dirname $(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)) && \
-    "$COMFY_DIR/venv/bin/pip" install --no-cache-dir --force-reinstall --no-deps \
+RUN "/comfy/venv/bin/pip" install --no-cache-dir --force-reinstall --no-deps \
         "huggingface_hub==1.7.1" "transformers==5.3.0" "tokenizers==0.22.2" && \
-    { "$COMFY_DIR/venv/bin/pip" uninstall -y xformers 2>/dev/null || true; }
+    { "/comfy/venv/bin/pip" uninstall -y xformers 2>/dev/null || true; }
 COPY boot.sh /studio/boot.sh
 RUN chmod +x /studio/boot.sh
-EXPOSE 22 7801
+EXPOSE 22 8188
 ENTRYPOINT ["/bin/bash", "/studio/boot.sh"]

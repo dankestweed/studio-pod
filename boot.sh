@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Studio pod entrypoint (baked into the image).
+# Studio pod entrypoint (baked into the image). Plain ComfyUI at /comfy, port 8188.
 # Env from the portal deploy: TS_AUTHKEY SB_KEY_B64 SB_USER SB_HOST
-#                             PORTAL_URL POD_SECRET WORKERS
+#                             PORTAL_URL POD_SECRET (WORKERS is ignored: one engine)
+# Optional: COMFY_EXTRA_ARGS (default --cache-none, keeps RAM under the pod's cgroup cap)
 # RunPod injects: PUBLIC_KEY (for ssh)
 set -uo pipefail
 TSIP=""
@@ -39,7 +40,7 @@ report tools "checking GPU"
 if ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
   fail "GPU never initialized (no NVIDIA device node)"
 fi
-VPY=$(find /SwarmUI/dlbackend -path '*/ComfyUI/venv/bin/python' 2>/dev/null | head -1)
+VPY=/comfy/venv/bin/python
 [ -x "$VPY" ] || VPY=python3
 GPU_OK=""
 for i in $(seq 1 24); do
@@ -111,90 +112,57 @@ PROG_PID=$!
 wait "$SYNC_PID" || report models "sync warnings (continuing)"
 kill "$PROG_PID" 2>/dev/null || true
 
-report engine "configuring ${WORKERS:-1} worker(s)"
-COMFY_MAIN=$(find /SwarmUI/dlbackend -name main.py -path '*/ComfyUI/main.py' | head -1)
-COMFY_REL=${COMFY_MAIN#/SwarmUI/}
+report engine "configuring the engine"
+COMFY=/comfy
+# models: ComfyUI's own models/ dir IS the volume library. Every ComfyUI category
+# (checkpoints, loras, diffusion_models, text_encoders, vae, ...) and every pack that
+# hard-codes ComfyUI's models dir (facetools landmarks/ultralytics, SEEDVR2...) lands on
+# /workspace/Models - no path config, no bridges. The repo's stock folders (incl. configs/)
+# are seeded add-only after the library sync so a full-mode sync can't strand them.
+cp -rn /comfy/models.dist/. /workspace/Models/ 2>/dev/null || true
+if [ ! -L "$COMFY/models" ]; then rm -rf "$COMFY/models"; ln -s /workspace/Models "$COMFY/models"; fi
 # custom nodes: library custom_nodes/ -> ComfyUI (add-only) + their pip requirements, before the engine loads
+CN_DIR="$COMFY/custom_nodes"
 if rclone lsd storagebox:custom_nodes >/dev/null 2>&1; then
   report engine "installing custom nodes"
-  CN_DIR="$(dirname "$COMFY_MAIN")/custom_nodes"
   rclone copy storagebox:custom_nodes "$CN_DIR" 2>/dev/null || true
-  PIPBIN="$(dirname "$COMFY_MAIN")/venv/bin/pip"
-  [ -x "$PIPBIN" ] || PIPBIN=pip
   for RQ in "$CN_DIR"/*/requirements.txt; do
-    [ -f "$RQ" ] && "$PIPBIN" install -q -r "$RQ" 2>/dev/null || true
+    [ -f "$RQ" ] && "$COMFY/venv/bin/pip" install -q -r "$RQ" 2>/dev/null || true
   done
 fi
-# pack-implied model paths: some packs (facetools) hard-code ComfyUI's OWN models dir,
-# sidestepping the SwarmUI model-root remap -> bridge those folders to the volume.
-CMODELS="$(dirname "$COMFY_MAIN")/models"
-for d in landmarks ultralytics; do
-  if [ -d "$CMODELS/$d" ] && [ -z "$(ls -A "$CMODELS/$d" 2>/dev/null)" ]; then rmdir "$CMODELS/$d"; fi
-  [ -e "$CMODELS/$d" ] || ln -sfn "/workspace/Models/$d" "$CMODELS/$d"
-done
-mkdir -p /SwarmUI/Data
-T=$(printf '\t')
-# AllowGpuSpecificOptimizations=false: stops Swarm adding '--fast fp16_accumulation cublas_ops'
-# to the comfy launch - fp16 accumulation overflows on Qwen edit -> NaN -> intermittent black frames
-cat > /SwarmUI/Data/Settings.fds <<SET
-IsInstalled: true
-Network:
-${T}Host: 0.0.0.0
-Paths:
-${T}ModelRoot: /workspace/Models
-${T}SDModelFolder: checkpoints
-${T}SDLoraFolder: loras
-${T}SDVAEFolder: vae
-${T}SDEmbeddingFolder: embeddings
-Performance:
-${T}AllowGpuSpecificOptimizations: false
-SET
-# --cache-none: comfy keeps every loaded model in RAM between runs by default; the full
-# pipeline (qwen edit + krea + 2x QwenVL + SRPO) outgrew the pod RAM cgroup -> oom_kill.
-# (--cache-ram is no use here: it reads host RAM, not the container limit)
-N=${WORKERS:-1}; case "$N" in 1|2|3|4) ;; *) N=1;; esac
-: > /SwarmUI/Data/Backends.fds
-for i in $(seq 0 $((N-1))); do
-cat >> /SwarmUI/Data/Backends.fds <<BEND
-${i}:
-${T}type: comfyui_selfstart
-${T}title: worker-${i}
-${T}enabled: true
-${T}settings:
-${T}${T}StartScript: ${COMFY_REL}
-${T}${T}GPU_ID: 0
-${T}${T}ExtraArgs: --enable-cors-header --cache-none
-BEND
-done
+COMFY_ARGS="--listen 0.0.0.0 --port 8188 --enable-cors-header --preview-method latent2rgb --disable-auto-launch ${COMFY_EXTRA_ARGS---cache-none}"
 
 report engine "starting the engine"
-cd /SwarmUI
-export PATH="/SwarmUI/.dotnet:$PATH"
-nohup ./launch-linux.sh --host 0.0.0.0 --launch_mode none > /var/log/swarmui.log 2>&1 &
+# supervisor: ComfyUI restarts itself if it dies (OOM kill etc.); each exit is logged
+( cd "$COMFY" && while true; do
+    echo "=== engine start $(date +%T) args: ${COMFY_ARGS}"
+    "$COMFY/venv/bin/python" -s main.py ${COMFY_ARGS}
+    echo "=== engine exited code=$? at $(date +%T); restarting in 5s"
+    sleep 5
+  done ) >> /var/log/comfyui.log 2>&1 &
 
 code=""
 for i in $(seq 1 120); do
-  code=$(curl -m 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7801/" || true)
+  code=$(curl -m 3 -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8188/" || true)
   case "$code" in 200|302) break;; esac
   [ $((i % 6)) -eq 0 ] && report engine "waited $((i * 5))s for first response"
   sleep 5
 done
-case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/swarmui.log)";; esac
+case "$code" in 200|302) ;; *) fail "engine did not come up (see /var/log/comfyui.log)";; esac
 
-sleep 8
 # reference images: library inputs/ <-> ComfyUI input/ (copy both ways, never delete)
-COMFY_INPUT="$(dirname "$COMFY_MAIN")/input"
+COMFY_INPUT="$COMFY/input"
 mkdir -p "$COMFY_INPUT"
 rclone copy storagebox:inputs "$COMFY_INPUT" --transfers 8 2>/dev/null || true
-# rescue generated outputs: raw comfy-tab saves land on the pod, not the VPS -> push
+# rescue generated outputs: saves land on the pod, not the VPS -> push
 # them home every minute into a per-session folder (comfy renumbers from 00001 each
 # session, so a shared folder would overwrite across sessions)
 SESSION_TAG=$(date +%Y%m%d-%H%M%S)
-COMFY_OUT="$(dirname "$COMFY_MAIN")/output"
-mkdir -p "$COMFY_OUT" /SwarmUI/Output
+COMFY_OUT="$COMFY/output"
+mkdir -p "$COMFY_OUT"
 
 # workflows: library workflows/ <-> ComfyUI's native workflow browser (two-way, never delete)
-COMFY_WF="$(dirname "$COMFY_MAIN")/user/default/workflows"
+COMFY_WF="$COMFY/user/default/workflows"
 mkdir -p "$COMFY_WF"
 WF_SEL=""; [ "$MODE" = selected ] && [ -s /tmp/wf.list ] && WF_SEL="--files-from /tmp/wf.list"
 # selected sessions get ONLY their chosen workflows (unvalidated ones must not open on the pod)
@@ -206,7 +174,6 @@ rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
     rclone copy "$COMFY_WF" storagebox:workflows --exclude "*.tmp" 2>/dev/null || true
     rclone copy storagebox:workflows "$COMFY_WF" $WF_SEL 2>/dev/null || true
     rclone copy "$COMFY_OUT" "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
-    rclone copy /SwarmUI/Output "storagebox:outputs/pod-${SESSION_TAG}" --exclude "*.tmp" 2>/dev/null || true
   done ) &
 
 # live metrics for the dashboard dials, every 4s
@@ -233,7 +200,7 @@ def get(u):
     except Exception: return None
 while True:
     runs, running, pending = [], 0, 0
-    for p in range(7821, 7829):
+    for p in (8188,):
         q = get(f"http://127.0.0.1:{p}/queue")
         if q is None: continue
         running += len(q.get("queue_running") or []); pending += len(q.get("queue_pending") or [])
@@ -247,7 +214,7 @@ while True:
             a, b = ts.get("execution_start"), ts.get("execution_success") or ts.get("execution_error")
             if a and b:
                 runs.append({"t": b/1000.0, "seconds": round((b-a)/1000.0, 1),
-                             "worker": p-7821, "ok": st.get("status_str") == "success"})
+                             "worker": 0, "ok": st.get("status_str") == "success"})
     runs.sort(key=lambda r: -r["t"])
     data = urllib.parse.urlencode({"payload": json.dumps({"runs": runs[:6], "running": running, "pending": pending})}).encode()
     try:
@@ -263,7 +230,7 @@ cat > /tmp/nodespush.py <<'PY'
 import json, os, time, urllib.request, urllib.parse
 for _ in range(60):
     try:
-        with urllib.request.urlopen("http://127.0.0.1:7821/object_info", timeout=8) as r:
+        with urllib.request.urlopen("http://127.0.0.1:8188/object_info", timeout=8) as r:
             classes = sorted(json.load(r).keys())
         data = urllib.parse.urlencode({"payload": json.dumps(classes)}).encode()
         req = urllib.request.Request(os.environ.get("PORTAL_URL", "") + "/api/pod/nodes", data=data,
@@ -282,7 +249,7 @@ import json, os, re, time, urllib.request, urllib.parse
 def collect():
     fails, seen = [], set()
     try:
-        log = open("/var/log/swarmui.log", errors="ignore").read()
+        log = open("/var/log/comfyui.log", errors="ignore").read()
     except Exception:
         return fails
     for m in re.finditer(r"Cannot import (\S*custom_nodes/([^/\s:]+))[^:]*: ?(.*)", log):
@@ -305,6 +272,6 @@ for wait in (60, 120):
 PY
 nohup python3 /tmp/importfails.py >/dev/null 2>&1 &
 
-report ready "engine online at ${TSIP} with ${N} worker(s)"
+report ready "engine online at ${TSIP}"
 echo "READY at ${TSIP}"
 sleep infinity
