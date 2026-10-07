@@ -47,5 +47,8 @@ https://github.com/Fannovel16/comfyui_controlnet_aux@0cd290477128d42cdc3e76a826a
 https://github.com/ClownsharkBatwing/RES4LYF@3d1d69da69ee47f7647d59e1bd0967e472fccc41
 # --- bake 4 (Sep 30): person mask for the SRPO skin-detailer workflow (mediapipe; already present) ---
 https://github.com/djbielejeski/a-person-mask-generator@d2587540ff7ce7154f3fddfbf01a8628d77bf3c9
+# --- bake 5 (Oct 7): LTX-2.5 union-control IC-LoRA video-to-video (IC-LoRA loader/guide nodes + Video Depth Anything annotator) ---
+https://github.com/Lightricks/ComfyUI-LTXVideo@3bf3ca62595f1764c47d01c35c8e5dfe47e1a88f
+https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything@a0db08e63d1ea571601c45cde4aaee0acdd0544d
 # WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
 https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
