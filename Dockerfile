@@ -47,6 +47,10 @@ RUN COMFY_DIR=/comfy && \
     echo "== custom_nodes now: $(ls "$COMFY_DIR/custom_nodes")" && \
     { "$COMFY_DIR/venv/bin/pip" cache purge || true; } && \
     rm -rf /root/.cache/pip
+# Vendored packs: upstream repos that disappeared, baked from our saved copies in vendor/.
+# ComfyUI-Krea2T-Enhancer (capitan01R, MIT) went private Oct 2026; copy = pinned 85baaf0 from the last good image.
+# No requirements.txt (imports only torch/transformers/comfy, already installed).
+COPY vendor/ComfyUI-Krea2T-Enhancer /comfy/custom_nodes/ComfyUI-Krea2T-Enhancer
 # QwenVL FP8 on CUDA<13 needs these exact pins (workflow author's verified set) -
 # installed LAST so no pack requirement can re-upgrade them; xformers out per same guide.
 RUN "/comfy/venv/bin/pip" install --no-cache-dir --force-reinstall --no-deps \

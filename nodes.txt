@@ -3,7 +3,8 @@
 #   <git-url>                  (tracks default branch - avoid; rebuilds become non-reproducible)
 # After editing: commit -> Actions rebuilds :latest -> next Start has the nodes.
 https://github.com/lbouaraba/ComfyUI-Krea2Edit@86f886dac23013d88996e3a2e99093ba44d322fb
-https://github.com/capitan01R/ComfyUI-Krea2T-Enhancer@85baaf0145b532ce3418b016cefca76f90648d6d
+# REMOVED Oct 28: repo went private/deleted upstream - pack now served from the Storage Box custom_nodes/ overlay (copied from the last good image)
+# https://github.com/capitan01R/ComfyUI-Krea2T-Enhancer@85baaf0145b532ce3418b016cefca76f90648d6d
 https://github.com/pixaroma/ComfyUI-Pixaroma@56e32d1676cab6700c54e4bdd37925f10867b970
 https://github.com/rgthree/rgthree-comfy@2c5342a8cb0eaecaabf61435a5f37dd594c510ba
 https://github.com/chflame163/ComfyUI_LayerStyle@5ba939099b33f998ecfbd63dcbbf089925b64a47
@@ -52,5 +53,8 @@ https://github.com/Lightricks/ComfyUI-LTXVideo@3bf3ca62595f1764c47d01c35c8e5dfe4
 https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything@a0db08e63d1ea571601c45cde4aaee0acdd0544d
 # --- bake 6 (Oct 28): MiniMax H3 character swap - BFS Shot Planner/Conditioning nodes (v1.115.33; H3 core nodes are in ComfyUI v0.38.2) ---
 https://github.com/alisson-anjos/ComfyUI-BFSNodes@1e76045b19a99882f1331c9d322a26fac60ae9b8
+# --- bake 7 (Oct 28): H3 swap workflows - akatz Relay V2 windows+SAM masks (v2.0.1, no pip deps) and LBH 3D latent upscaler (einops) ---
+https://github.com/akatz-ai/h3-relay@e2a7665b6eb8ea37a88c0de2c9c6b69a8f7c9220
+https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler@40316cf008b2fd8663263270669eb4da23f89d2c
 # WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
 https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
