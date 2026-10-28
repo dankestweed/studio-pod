@@ -50,5 +50,7 @@ https://github.com/djbielejeski/a-person-mask-generator@d2587540ff7ce7154f3fddfb
 # --- bake 5 (Oct 7): LTX-2.5 union-control IC-LoRA video-to-video (IC-LoRA loader/guide nodes + Video Depth Anything annotator) ---
 https://github.com/Lightricks/ComfyUI-LTXVideo@3bf3ca62595f1764c47d01c35c8e5dfe47e1a88f
 https://github.com/yuvraj108c/ComfyUI-Video-Depth-Anything@a0db08e63d1ea571601c45cde4aaee0acdd0544d
+# --- bake 6 (Oct 28): MiniMax H3 character swap - BFS Shot Planner/Conditioning nodes (v1.115.33; H3 core nodes are in ComfyUI v0.38.2) ---
+https://github.com/alisson-anjos/ComfyUI-BFSNodes@1e76045b19a99882f1331c9d322a26fac60ae9b8
 # WanAnimatePreprocess LAST: its onnxruntime-gpu must win over Qwen-TTS's onnxruntime-openvino (same module namespace)
 https://github.com/kijai/ComfyUI-WanAnimatePreprocess@0e0b6a2a555625acf4d4aefb780e27d06937132f
