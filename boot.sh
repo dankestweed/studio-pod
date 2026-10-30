@@ -2,6 +2,7 @@
 # Studio pod entrypoint (baked into the image). Plain ComfyUI at /comfy, port 8188.
 # Env from the portal deploy: TS_AUTHKEY SB_KEY_B64 SB_USER SB_HOST
 #                             PORTAL_URL POD_SECRET (WORKERS is ignored: one engine)
+# Shared library (optional): LIB_HOST LIB_USER LIB_KEY_B64 (read-only subaccount)
 # Optional: COMFY_EXTRA_ARGS (default --cache-none, keeps RAM under the pod's cgroup cap)
 # RunPod injects: PUBLIC_KEY (for ssh)
 set -uo pipefail
@@ -75,6 +76,21 @@ CONF
 # a dead sftp stream must error out, never hang the boot or the sync loops
 export RCLONE_TIMEOUT=60s RCLONE_CONTIMEOUT=30s RCLONE_LOW_LEVEL_RETRIES=5
 rclone lsd storagebox: >/dev/null 2>&1 || fail "storage unreachable"
+if [ -n "${LIB_KEY_B64:-}" ]; then
+  echo "${LIB_KEY_B64}" | base64 -d > /root/.ssh/library
+  chmod 600 /root/.ssh/library
+  cat >> /root/.config/rclone/rclone.conf <<CONF
+
+[library]
+type = sftp
+host = ${LIB_HOST:?}
+user = ${LIB_USER:?}
+port = 23
+key_file = /root/.ssh/library
+shell_type = none
+CONF
+  rclone lsd library: >/dev/null 2>&1 || fail "shared library unreachable"
+fi
 
 # session manifest: the portal says whether this Start is a selected-workflows session
 # (sync only whats needed) or a full-library one. Any failure -> full (old behavior).
@@ -92,7 +108,29 @@ then MODE=selected; fi
 
 # models live on the volume (/workspace): fits the growing library and survives Stop->Resume
 mkdir -p /workspace/Models
-if [ "$MODE" = selected ]; then
+RC_SYNC="--transfers 8 --checkers 16 --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log"
+if [ -n "${LIB_KEY_B64:-}" ]; then
+  # shared library: everything but loras/characters/, which stays on the tenant's own remote.
+  # The excludes also keep a full sync from deleting those private files on the volume.
+  sync_models() {
+    if [ "$MODE" = selected ]; then
+      grep -v '^loras/characters/' /tmp/models.list > /tmp/models-lib.list || true
+      grep '^loras/characters/' /tmp/models.list > /tmp/models-own.list || true
+      rclone copy library: /workspace/Models --files-from /tmp/models-lib.list $RC_SYNC || return 1
+      rclone copy storagebox:models /workspace/Models --files-from /tmp/models-own.list $RC_SYNC
+    else
+      rclone sync library: /workspace/Models --exclude ".ssh/**" --exclude ".trash/**" --exclude "/loras/characters/**" \
+        --fast-list $RC_SYNC || return 1
+      rclone copy storagebox:models/loras/characters /workspace/Models/loras/characters $RC_SYNC
+    fi
+  }
+  if [ "$MODE" = selected ]; then
+    report models "syncing $(wc -l < /tmp/models.list | tr -d ' ') selected model(s)"
+  else
+    report models "syncing models"
+  fi
+  sync_models &
+elif [ "$MODE" = selected ]; then
   report models "syncing $(wc -l < /tmp/models.list | tr -d ' ') selected model(s)"
   rclone copy storagebox:models /workspace/Models --files-from /tmp/models.list --transfers 8 --checkers 16 \
     --stats 10s --stats-one-line --stats-log-level NOTICE --log-level NOTICE --log-file /tmp/rclone-sync.log &
